@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  The router uses a self-signed certificate on 192.168.100.1.
+  OkHttp is configured (in net/RouterApi.kt) to trust it explicitly for this host.
+  This config additionally permits cleartext to the router (port 80 redirects to 443)
+  and trusts user-added CAs, so the connection works on all API levels.
+-->
+<network-security-config>
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="false">192.168.100.1</domain>
+        <trust-anchors>
+            <certificates src="system" />
+            <certificates src="user" />
+        </trust-anchors>
+    </domain-config>
+</network-security-config>
