@@ -36,6 +36,9 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalLayoutDirection
+import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
@@ -66,9 +69,27 @@ private data class Confirm(
 ) : Sheet
 private data class DeviceCtl(val d: Device) : Sheet
 
+private val PHONE_HINTS = listOf(
+    "phone", "iphone", "mobile", "android", "galaxy", "redmi", "xiaomi", "poco", "realme",
+    "oppo", "vivo", "oneplus", "honor", "iqoo", "samsung", "tecno", "infinix", "huawei", "note"
+)
+private val DESKTOP_HINTS = listOf(
+    "pc", "desktop", "laptop", "notebook", "macbook", "imac", "thinkpad", "lenovo", "dell",
+    "msi", "acer", "asus", "workstation", "server", "linux", "windows"
+)
+private fun deviceIcon(name: String): ImageVector {
+    val n = name.lowercase()
+    return when {
+        PHONE_HINTS.any { n.contains(it) } -> WIcon.device
+        DESKTOP_HINTS.any { n.contains(it) } -> WIcon.desktop
+        else -> WIcon.wifi
+    }
+}
+
 /** Speed preset: [key] is stable/persisted, [label] is only for display. */
 private data class SpeedOpt(val key: String, val label: String, val ds: Int, val us: Int)
 private data class SsidEdit(val current: String) : Sheet
+private object GuestEdit : Sheet
 
 /** Smart-suggestion card. [kind] picks the accent: good / warn / bad / accent / info. */
 private data class Tip(
@@ -115,13 +136,17 @@ fun OnuApp(vm: RouterViewModel = viewModel()) {
     LaunchedEffect(Unit) { delay(1700); splash = false }
     // one silent update check per app open (no login needed)
     LaunchedEffect(Unit) { vm.checkUpdate(auto = true) }
-    // auto keep-alive: reconnect/re-login if the connection drops while idle
+    // auto keep-alive: reconnect/re-login if the connection drops while idle (poll every minute,
+    // and only when nothing changed does the UI stay untouched — no pointless recomposition)
     LaunchedEffect(vm.loggedIn) {
-        while (vm.loggedIn) { delay(15000); vm.heartbeat() }
+        while (vm.loggedIn) { delay(60_000); vm.heartbeat() }
     }
-    // back: close the sheet first, then fall back to Home, then let the system exit
+    // back: close the sheet first, then fall back to the previous screen (the browsing check
+    // opens from Suggestions, so its back target is Suggestions), then Home, then exit
     BackHandler(enabled = sheet != null || (vm.loggedIn && vm.screen != "home")) {
-        if (sheet != null) sheet = null else vm.screen = "home"
+        if (sheet != null) sheet = null
+        else if (vm.screen == "speed") vm.screen = "tips"
+        else vm.screen = "home"
     }
     Box(Modifier.fillMaxSize().background(tk.surface2)) {
         if (!vm.loggedIn) LoginScreen(vm) else MainScaffold(vm) { sheet = it }
@@ -259,7 +284,7 @@ private fun MainScaffold(vm: RouterViewModel, setSheet: (Sheet?) -> Unit) {
             Column(Modifier.weight(1f)) {
                 Text(
                     when (vm.screen) {
-                        "devices" -> s("Devices", "الأجهزة"); "protect" -> s("Protection", "الحماية")
+                        "devices" -> s("Devices", "الأجهزة"); "protect" -> s("Settings", "الإعدادات")
                         "more" -> s("More", "المزيد"); "tips" -> s("Suggestions", "نصائح")
                         "speed" -> s("Browsing check", "فحص التصفح")
                         else -> s("Home", "الرئيسية")
@@ -296,7 +321,7 @@ private fun BottomNav(vm: RouterViewModel) {
         ) {
             NavItem(vm, "home", WIcon.home, s("Home", "الرئيسية"))
             NavItem(vm, "devices", WIcon.devices, s("Devices", "الأجهزة"))
-            NavItem(vm, "protect", WIcon.shield, s("Protection", "الحماية"))
+            NavItem(vm, "protect", WIcon.cog, s("Settings", "الإعدادات"))
             NavItem(vm, "more", WIcon.more, s("More", "المزيد"))
         }
     }
@@ -430,19 +455,28 @@ private fun TipsScreen(vm: RouterViewModel) {
             s("Received light is ${vm.rxDbm} dBm — below the healthy ~-22 dBm. Check the fiber joint/connector.",
                 "استقبال الضوء ${vm.rxDbm} dBm — أقل من الحد الصحي ~-22 dBm. افحص موصل الألياف والوصلات."),
         )) }
-        if (isEmpty() && vm.conn == Conn.Connected) add(Tip(
-            WIcon.bulb, "good",
-            s("All good", "كل شيء تمام"),
-            s("No changes needed right now. Run the MTU check to be sure, and nothing else looks off.",
-                "لا حاجة لتغييرات حالياً. شغّل فحص MTU للتأكد، ولا شيء آخر غير طبيعي.")
-        ))
     }
+    // When nothing needs attention, show a slim "all good" banner at the top instead of a card.
+    val allGood = vm.conn == Conn.Connected && tips.isEmpty()
 
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(10.dp)) {
         SectionHeader(s("Network analysis", "تحليل الشبكة")) {
             if (vm.conn == Conn.Connected && vm.recommendationCount > 0)
                 Badge("${vm.recommendationCount} " + s("suggestions", "توصيات"), tk.accent, tk.accentSoft)
+        }
+        if (allGood) {
+            Row(Modifier.fillMaxWidth().clip(RoundedCornerShape(14.dp)).background(tk.goodSoft)
+                    .padding(horizontal = 12.dp, vertical = 11.dp), verticalAlignment = Alignment.CenterVertically) {
+                Icon(Icons.Filled.CheckCircle, null, tint = tk.good, modifier = Modifier.size(22.dp))
+                Spacer(Modifier.width(10.dp))
+                Column {
+                    Text(s("All good", "كل شيء تمام"), fontFamily = tk.ui, fontWeight = FontWeight.W700, fontSize = 13.5.sp, color = tk.good)
+                    Text(s("Everything below is healthy — no changes needed.",
+                            "كل ما تحت ده تمام — لا حاجة لأي تغييرات."),
+                        fontFamily = tk.ui, fontSize = 11.sp, color = tk.ink2)
+                }
+            }
         }
         MtuCheckCard(vm)
         PanelCard {
@@ -457,6 +491,7 @@ private fun TipsScreen(vm: RouterViewModel) {
             fontFamily = tk.ui, fontSize = 11.5.sp, color = tk.ink3
         )
         Spacer(Modifier.height(4.dp))
+        VersionFooter()
     }
 }
 
@@ -485,15 +520,14 @@ private fun TipsScreen(vm: RouterViewModel) {
                         fontFamily = tk.ui, fontSize = 12.sp, color = tk.ink2
                     )
                 }
-                if (running) CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp, color = tk.accent)
+                if (running) CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp, color = tk.accent)
+                else Box(Modifier.clip(RoundedCornerShape(9.dp)).background(tk.accentSoft)
+                        .clickable { vm.runMtuProbe() }.padding(horizontal = 12.dp, vertical = 6.dp), Alignment.Center) {
+                    Text(if (vm.probeState == "idle") s("Run", "تشغيل") else s("Run again", "أعد"),
+                        color = tk.accent, fontFamily = tk.ui, fontWeight = FontWeight.W700, fontSize = 12.5.sp)
+                }
             }
-            Spacer(Modifier.height(12.dp))
-            if (!running) PrimaryButton(
-                if (vm.probeState == "idle") s("Run MTU check", "تشغيل فحص MTU") else s("Run again", "أعد الفحص"),
-                null, false, true
-            ) { vm.runMtuProbe() }
         }
-        VersionFooter()
     }
 }
 
@@ -515,7 +549,10 @@ private fun SpeedScreen(vm: RouterViewModel) {
         verticalArrangement = Arrangement.spacedBy(10.dp)) {
         SectionHeader(s("Browsing speed check", "فحص سرعة التصفح")) {
             if (running) CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp, color = tk.accent)
-            else PrimaryButton(s("Rerun", "إعادة"), null, false, true) { vm.runSpeedCheck() }
+            else Box(Modifier.clip(RoundedCornerShape(9.dp)).background(tk.accentSoft)
+                    .clickable { vm.runSpeedCheck() }.padding(horizontal = 12.dp, vertical = 6.dp), Alignment.Center) {
+                Text(s("Rerun", "إعادة"), color = tk.accent, fontFamily = tk.ui, fontWeight = FontWeight.W700, fontSize = 12.5.sp)
+            }
         }
         Text(
             s("All tests run from this phone through your Wi-Fi and line — no router login needed. Sweep below and apply what's worth it.",
@@ -797,7 +834,7 @@ private fun uptimeHuman(sec: Long, lang: String): String {
             Text(title, fontFamily = tk.ui, fontWeight = FontWeight.W600, fontSize = 14.sp, color = tk.ink)
             Text(sub, fontFamily = tk.ui, fontSize = 12.sp, color = tk.ink2)
         }
-        Icon(WIcon.chevron, null, tint = tk.ink3)
+        Chevron(tk.ink3)
     }
 }
 
@@ -821,8 +858,6 @@ private fun TabPill(m: Modifier, sel: Boolean, label: String, count: Int, fg: Co
 private fun DevicesScreen(vm: RouterViewModel, setSheet: (Sheet?) -> Unit) {
     val tk = tk()
     fun s(en: String, ar: String) = tr(vm.lang, en, ar)
-    var query by remember { mutableStateOf("") }
-    var searching by remember { mutableStateOf(false) }
     var tab by remember { mutableStateOf(0) }
     LaunchedEffect(Unit) { vm.refresh() }
 
@@ -839,12 +874,7 @@ private fun DevicesScreen(vm: RouterViewModel, setSheet: (Sheet?) -> Unit) {
                 else -> !d.online && !b
             }
         }
-        .filter {
-            val t = query.trim().lowercase()
-            t.isEmpty() || it.name.lowercase().contains(t) ||
-                it.ip.contains(t) || it.mac.lowercase().contains(t)
-        }
-        .sortedWith(compareBy({ it.name.lowercase() }))
+        .sortedWith(compareBy({ (vm.deviceAlias[it.mac.uppercase()] ?: it.name).lowercase() }))
 
     LazyColumn(Modifier.fillMaxSize().padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
         item {
@@ -861,61 +891,40 @@ private fun DevicesScreen(vm: RouterViewModel, setSheet: (Sheet?) -> Unit) {
                 TabPill(Modifier.weight(1f), tab == 2, s("Offline", "غير متصل"), cntOffline, tk.ink2, tk.surface3, tk.accent) { tab = 2 }
             }
         }
-        if (tab == 1 && vm.blocked.isNotEmpty()) item {
-            Row(Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(tk.badSoft).padding(12.dp),
-                verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                Icon(WIcon.block, null, tint = tk.bad, modifier = Modifier.size(18.dp))
-                Text(
-                    s("Blocking only cuts internet — devices stay connected. Tap a blocked device to unblock instantly (no restart).",
-                        "الحجب يقطع الإنترنت فقط — الأجهزة تظل متصلة. اضغط الجهاز المحجوب لفك الحجب فورًا (بدون إعادة تشغيل)."),
-                    fontFamily = tk.ui, fontSize = 12.sp, color = tk.ink
-                )
-            }
-        }
-        item {
-            if (!searching) {
-                Row(Modifier.fillMaxWidth().padding(bottom = 4.dp), verticalAlignment = Alignment.CenterVertically) {
-                    Text(s("Search by name, IP or MAC", "ابحث بالاسم أو IP أو MAC"),
-                        modifier = Modifier.weight(1f),
-                        fontFamily = tk.ui, fontSize = 12.5.sp, fontWeight = FontWeight.W600, color = tk.ink2)
-                    IconBtn(WIcon.search, s("Search", "بحث")) { searching = true }
-                }
-            } else {
-                Field(vm, s("Search by name, IP or MAC", "ابحث بالاسم أو IP أو MAC"), query, { query = it }, mono = true,
-                    trailing = { IconBtn(WIcon.close, s("Close search", "إغلاق البحث")) { searching = false; query = "" } })
-            }
+item {
         }
         if (active.isEmpty()) item {
             Text(
                 when {
                     vm.devices.isEmpty() -> s("No devices yet.", "لا أجهزة بعد.")
                     tab == 1 -> s("No blocked devices.", "لا أجهزة محجوبة.")
-                    query.isNotBlank() -> s("No device matches your search.", "لا يوجد جهاز مطابق للبحث.")
                     else -> s("No devices in this tab.", "لا توجد أجهزة في هذا التبويب.")
                 },
                 fontFamily = tk.ui, fontSize = 13.sp, color = tk.ink2
             )
         }
         items(active) { d ->
-            val label = vm.speedLabel[d.mac.uppercase()] ?: "Max"
-            val isBlocked = vm.blocked.containsKey(d.mac.uppercase())
+            val macKey = d.mac.uppercase()
+            val label = vm.speedLabel[macKey] ?: "Max"
+            val isBlocked = vm.blocked.containsKey(macKey)
             val isMax = label == "Max"
             val frac = if (isMax) 1f else (label.toFloatOrNull() ?: 20f) / 20f
             PanelCard(Modifier.fillMaxWidth().clickable { setSheet(DeviceCtl(d)) }) {
                 Column(Modifier.padding(12.dp)) {
                     Row(verticalAlignment = Alignment.Top) {
                         Box(Modifier.size(38.dp).clip(RoundedCornerShape(11.dp)).background(tk.surface3), Alignment.Center) {
-                            val wifi = d.conn.contains("WIFI", true) || d.conn == "2.4G" || d.conn == "5G"
-                            Icon(if (wifi) WIcon.wifi else WIcon.device, null,
-                                tint = tk.ink2, modifier = Modifier.size(19.dp))
+                            Icon(deviceIcon(d.name), null, tint = tk.ink2, modifier = Modifier.size(19.dp))
                         }
                         Spacer(Modifier.width(12.dp))
                         Column(Modifier.weight(1f)) {
-                            Text(d.name, fontFamily = tk.ui, fontWeight = FontWeight.W600, fontSize = 14.sp, color = tk.ink,
+                            Text(vm.deviceAlias[macKey] ?: d.name, fontFamily = tk.ui, fontWeight = FontWeight.W600, fontSize = 14.sp, color = tk.ink,
                                 maxLines = 1, overflow = TextOverflow.Ellipsis)
                             Text(if (d.ip.isBlank()) s("— no IP (offline)", "— بدون IP (غير متصل)") else d.ip,
-                                fontFamily = tk.mono, fontSize = 11.5.sp, color = tk.ink2, maxLines = 1)
-                            Text(d.mac, fontFamily = tk.mono, fontSize = 11.5.sp, color = tk.ink2, maxLines = 1)
+                                fontFamily = tk.mono, fontSize = 11.5.sp, lineHeight = 12.5.sp,
+                                color = tk.ink2, maxLines = 1)
+                            Text(d.mac, fontFamily = tk.mono, fontSize = 11.5.sp, lineHeight = 12.5.sp,
+                                color = tk.ink2, maxLines = 1)
+                            DevStatLine(vm, macKey)
                         }
                         ChipLabel(
                             when {
@@ -935,8 +944,8 @@ private fun DevicesScreen(vm: RouterViewModel, setSheet: (Sheet?) -> Unit) {
                                 .background(Brush.horizontalGradient(listOf(tk.accent, tk.indigo))))
                         }
                         Spacer(Modifier.width(10.dp))
-                        Text(if (isMax) s("Max", "بلا حدود") else "$label Mbps",
-                            fontFamily = tk.mono, fontSize = 11.sp, color = tk.ink2)
+                        Text(if (isMax) s("Max speed", "بلا حدود") else "$label Mbps",
+                            fontFamily = tk.ui, fontSize = 11.sp, color = tk.ink2)
                     }
                 }
             }
@@ -982,11 +991,11 @@ private fun ProtectionScreen(vm: RouterViewModel, setSheet: (Sheet?) -> Unit) {
     )
     var sel by remember { mutableIntStateOf(0) }
     var mtuVal by remember { mutableStateOf("") }
-    LaunchedEffect(Unit) { vm.loadMtu() }
+    LaunchedEffect(Unit) { vm.loadMtu(); vm.runMtuProbe() }
 
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(10.dp)) {
-        SectionHeader(s("Block ads & malware", "حجب الإعلانات والفيروسات")) { Badge(s("Restarts", "يعيد التشغيل"), tk.warn, tk.warnSoft) }
+        SectionHeader(s("DNS", "DNS")) { Badge(s("Restarts", "يعيد التشغيل"), tk.warn, tk.warnSoft) }
         Text(s("Pick a DNS — applied to every device.", "اختر DNS — يُطبَّق على كل الأجهزة."),
             fontFamily = tk.ui, fontSize = 12.sp, color = tk.ink2)
         Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
@@ -1027,38 +1036,45 @@ private fun ProtectionScreen(vm: RouterViewModel, setSheet: (Sheet?) -> Unit) {
             }
         }
         Spacer(Modifier.height(4.dp))
-        SectionHeader(s("MTU size", "حجم MTU")) { if (vm.mtu != null) Badge("${vm.mtu} B", tk.accent, tk.accentSoft) }
+        SectionHeader(s("Settings", "الإعدادات")) {
+            when {
+                vm.probeState == "running" -> CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp, color = tk.accent)
+                vm.probedMtu != null && vm.probedMtu != vm.mtu ->
+                    Badge(s("Recommended", "موصى به") + " ${vm.probedMtu}", tk.good, tk.goodSoft)
+                else -> if (vm.mtu != null) Badge("${vm.mtu} B", tk.accent, tk.accentSoft)
+            }
+        }
+        val typedMtu = mtuVal.toIntOrNull()
+        val effective = typedMtu ?: vm.mtu
+        val lowerTo = vm.probedMtu?.takeIf { p -> effective != null && effective > p }
         Text(s("Max transmission unit of your internet link — it affects browsing and speed. Wrong values can drop the connection.",
             "أكبر حجم لرزمة البيانات على خط الإنترنت — يؤثر على التصفح والسرعة. قيم خاطئة قد تقطع الإنترنت."),
             fontFamily = tk.ui, fontSize = 12.sp, color = tk.ink2)
-        LaunchedEffect(vm.mtu) { if (vm.mtu != null && mtuVal.isBlank()) mtuVal = vm.mtu!!.toString() }
-        val presets = intArrayOf(1400, 1450, 1472, 1492, 1500)
-        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            presets.forEach { p ->
-                val on = mtuVal.toIntOrNull() == p
-                Box(
-                    Modifier.weight(1f).height(40.dp).clip(RoundedCornerShape(10.dp))
-                        .background(if (on) tk.accentSoft else tk.surface3)
-                        .border(1.5.dp, if (on) tk.accent else Color.Transparent, RoundedCornerShape(10.dp))
-                        .clickable { mtuVal = p.toString() },
-                    Alignment.Center
-                ) { Text(p.toString(), fontFamily = tk.mono, fontSize = 12.sp,
-                    fontWeight = if (on) FontWeight.W700 else FontWeight.W500,
-                    color = if (on) tk.accent else tk.ink2) }
+        Field(vm, s("Settings", "الإعدادات"), mtuVal, { mtuVal = it },
+            mono = true, keyboard = KeyboardType.Number,
+            placeholder = vm.mtu?.toString() ?: vm.probedMtu?.toString(),
+            trailing = lowerTo?.let { r ->
+                { Box(Modifier.padding(end = 8.dp).clip(RoundedCornerShape(9.dp)).background(tk.goodSoft)
+                        .padding(horizontal = 8.dp, vertical = 4.dp)) {
+                    Text(s("Recommended", "موصى به") + " $r", color = tk.good, fontFamily = tk.ui, fontWeight = FontWeight.W700, fontSize = 11.sp)
+                } }
+            })
+        if (vm.probeState == "failed")
+            Text(s("MTU probe got no reply — the recommended value stays unknown. Check the internet and re-enter.",
+                    "فحص MTU ماوصلش لرد — القيمة الموصى بها لسه مجهولة. تأكد من النت وأعد الدخول للصفحة."),
+                fontFamily = tk.ui, fontSize = 11.sp, color = tk.warn)
+        val changed = typedMtu != null && typedMtu in 576..1500 && typedMtu != vm.mtu
+        if (changed) {
+            PrimaryButton(s("Save MTU", "حفظ MTU"), null, false, true) {
+                val v = typedMtu ?: return@PrimaryButton
+                setSheet(Confirm(
+                    s("Change MTU", "تغيير MTU"),
+                    s("Applied to the internet link of the router, then it will restart.",
+                        "يُطبَّق على خط الإنترنت الخاص بالراوتر، ثم سيعيد التشغيل."),
+                    listOf("MTU" to "$v", s("Current", "الحالي") to (vm.mtu?.toString() ?: "—")),
+                    s("Apply & restart", "تطبيق وإعادة تشغيل"), false
+                ) { vm.applyMtu(v) })
             }
-        }
-        Field(vm, s("MTU (bytes)", "حجم MTU (بايت)"), mtuVal, { mtuVal = it },
-            mono = true, keyboard = KeyboardType.Number)
-        PrimaryButton(s("Save MTU", "حفظ MTU"), null, false,
-            (mtuVal.toIntOrNull() ?: 0) in 576..1500 && (mtuVal.toIntOrNull() ?: 0) != vm.mtu) {
-            val v = mtuVal.toIntOrNull() ?: return@PrimaryButton
-            setSheet(Confirm(
-                s("Change MTU", "تغيير MTU"),
-                s("Applied to the internet link of the router, then it will restart.",
-                    "يُطبَّق على خط الإنترنت الخاص بالراوتر، ثم سيعيد التشغيل."),
-                listOf("MTU" to "$v", s("Current", "الحالي") to (vm.mtu?.toString() ?: "—")),
-                s("Apply & restart", "تطبيق وإعادة تشغيل"), false
-            ) { vm.applyMtu(v) })
         }
         WifiRadioSection(vm, setSheet)
         Spacer(Modifier.height(4.dp))
@@ -1195,8 +1211,42 @@ private fun MoreScreen(vm: RouterViewModel, setSheet: (Sheet?) -> Unit) {
                 Badge(s("Edit", "تعديل"), tk.accent, tk.accentSoft)
             }
             Divider2()
-            InfoRow(WIcon.lock, s("Wi-Fi password", "باسورد الواي فاي"),
-                s("Protected by router", "محمي بفيرموير الراوتر"), tk.ink3, tk.surface3) { Badge(s("Encrypted", "مشفّر"), tk.ink3, tk.surface3) }
+            // Guest network. This firmware has no Guest Wi-Fi feature, so it is an extra SSID
+            // with client isolation — see RouterApi.addSsid.
+            LaunchedEffect(Unit) { vm.loadWlanRadios() }
+            val guest = vm.guestRadio
+            Row(
+                Modifier.fillMaxWidth()
+                    .clickable(enabled = vm.guestKnown) { setSheet(GuestEdit) }
+                    .padding(14.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Box(Modifier.size(38.dp).clip(RoundedCornerShape(11.dp))
+                    .background(if (guest?.enabled == true) tk.goodSoft else tk.surface3), Alignment.Center) {
+                    Icon(WIcon.devices, null,
+                        tint = if (guest?.enabled == true) tk.good else tk.ink3,
+                        modifier = Modifier.size(19.dp))
+                }
+                Spacer(Modifier.width(12.dp))
+                Column(Modifier.weight(1f)) {
+                    Text(s("Guest network", "شبكة الضيوف"), fontFamily = tk.ui,
+                        fontWeight = FontWeight.W600, fontSize = 14.sp, color = tk.ink)
+                    Text(
+                        when {
+                            !vm.guestKnown -> s("Reading…", "جاري القراءة…")
+                            guest == null -> s("Not set up — tap to create", "غير مفعّلة — اضغط للإنشاء")
+                            else -> guest.ssid + " · " + vm.guestBands.sorted().joinToString(" + ")
+                        },
+                        fontFamily = if (guest != null) tk.mono else tk.ui,
+                        fontSize = 12.sp, color = tk.ink2, maxLines = 1, overflow = TextOverflow.Ellipsis
+                    )
+                }
+                if (guest != null) {
+                    SmallSwitch(checked = guest.enabled, onCheckedChange = { vm.setGuestEnabled(it) })
+                } else if (vm.guestKnown) {
+                    Badge(s("Create", "إنشاء"), tk.accent, tk.accentSoft)
+                }
+            }
             Divider2()
             Row(Modifier.padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
                 Box(Modifier.size(38.dp).clip(RoundedCornerShape(11.dp)).background(tk.goodSoft), Alignment.Center) {
@@ -1262,7 +1312,7 @@ private fun MoreScreen(vm: RouterViewModel, setSheet: (Sheet?) -> Unit) {
                         color = when { up -> tk.accent; checking -> tk.ink2; else -> tk.ink3 }, maxLines = 2)
                 }
                 if (up) Badge(s("Install", "تثبيت"), tk.accent, tk.accentSoft)
-                else Icon(WIcon.chevron, null, tint = tk.ink3)
+                else Chevron(tk.ink3)
             }
         }
 
@@ -1338,56 +1388,119 @@ private fun MoreScreen(vm: RouterViewModel, setSheet: (Sheet?) -> Unit) {
 private fun SheetHost(sheet: Sheet?, vm: RouterViewModel, setSheet: (Sheet?) -> Unit) {
     val tk = tk()
     val open = sheet != null
-    // scrim
-    AnimatedVisibility(open, enter = fadeIn(), exit = fadeOut()) {
-        Box(Modifier.fillMaxSize().background(Color(0x80060C14)).clickable { setSheet(null) })
-    }
-    AnimatedVisibility(
-        open, modifier = Modifier.fillMaxSize(),
-        enter = slideInVertically(initialOffsetY = { it }), exit = slideOutVertically(targetOffsetY = { it })
-    ) {
-        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.BottomCenter) {
+    // Keep the last body around while the sheet slides back down: reading `sheet` directly
+    // emptied the panel the instant it went null, so the exit animation had nothing to move
+    // and the sheet looked like it just blinked out.
+    var shown by remember { mutableStateOf<Sheet?>(null) }
+    LaunchedEffect(sheet) { if (sheet != null) shown = sheet }
+
+    Box(Modifier.fillMaxSize()) {
+        AnimatedVisibility(open, enter = fadeIn(tween(220)), exit = fadeOut(tween(200))) {
+            Box(Modifier.fillMaxSize().background(Color(0x80060C14)).clickable { setSheet(null) })
+        }
+        AnimatedVisibility(
+            open,
+            modifier = Modifier.align(Alignment.BottomCenter),
+            // the offset is the panel's own height now, so it travels exactly its own length
+            enter = slideInVertically(tween(300, easing = FastOutSlowInEasing)) { it } +
+                fadeIn(tween(180)),
+            exit = slideOutVertically(tween(240, easing = FastOutLinearInEasing)) { it } +
+                fadeOut(tween(200))
+        ) {
             Column(
                 Modifier.fillMaxWidth().clip(RoundedCornerShape(topStart = 24.dp, topEnd = 24.dp))
                     .background(tk.panel).navigationBarsPadding().padding(20.dp)
             ) {
                 Box(Modifier.align(Alignment.CenterHorizontally).padding(bottom = 14.dp)
                     .size(width = 38.dp, height = 4.dp).clip(CircleShape).background(tk.line2))
-                when (val sh = sheet) {
+                when (val sh = shown) {
                     is Confirm -> ConfirmBody(vm, sh, setSheet)
                     is DeviceCtl -> DeviceBody(vm, sh.d, setSheet)
                     is SsidEdit -> SsidEditBody(vm, sh, setSheet)
+                    is GuestEdit -> GuestBody(vm, setSheet)
                     else -> {}
                 }
             }
         }
     }
 }
-
 @Composable
 private fun ColumnScope.SsidEditBody(vm: RouterViewModel, sh: SsidEdit, setSheet: (Sheet?) -> Unit) {
     val tk = tk()
     fun s(en: String, ar: String) = tr(vm.lang, en, ar)
     var name by remember { mutableStateOf(sh.current) }
+    var pass by remember { mutableStateOf("") }
+    var showPass by remember { mutableStateOf(false) }
+    var band by remember { mutableStateOf("both") }
+    // pull the live radio list so we know which bands exist and what the current password is
+    LaunchedEffect(Unit) { vm.loadWlanRadios() }
+    val radios = vm.wlanLive
+
     Box(Modifier.align(Alignment.CenterHorizontally).size(52.dp).clip(RoundedCornerShape(16.dp))
         .background(tk.indigoSoft), Alignment.Center) {
         Icon(WIcon.wifi, null, tint = tk.indigo, modifier = Modifier.size(26.dp))
     }
     Spacer(Modifier.height(14.dp))
-    Text(s("Change Wi-Fi Name (SSID)", "تعديل اسم شبكة الواي فاي"), fontFamily = tk.ui, fontWeight = FontWeight.W700, fontSize = 19.sp, color = tk.ink,
+    Text(s("Wi-Fi name & password", "اسم وكلمة سر الواي فاي"), fontFamily = tk.ui,
+        fontWeight = FontWeight.W700, fontSize = 19.sp, color = tk.ink,
         modifier = Modifier.fillMaxWidth(), textAlign = TextAlign.Center)
     Spacer(Modifier.height(8.dp))
-    Text(s("Changing Wi-Fi name requires the router to restart.", "تعديل اسم الشبكة يتطلب إعادة تشغيل الراوتر لتطبيقه."),
-        fontFamily = tk.ui, fontSize = 13.sp, color = tk.ink2, textAlign = TextAlign.Center, modifier = Modifier.fillMaxWidth())
+    Text(s("Applied instantly — no restart. Devices reconnect with the new settings.",
+           "بيتطبّق فوراً — من غير إعادة تشغيل. الأجهزة هتتصل بالإعدادات الجديدة."),
+        fontFamily = tk.ui, fontSize = 13.sp, color = tk.ink2, textAlign = TextAlign.Center,
+        modifier = Modifier.fillMaxWidth())
     Spacer(Modifier.height(14.dp))
-    Field(vm, s("New Wi-Fi name", "اسم الشبكة الجديد"), name, { name = it }, mono = true)
-    Spacer(Modifier.height(16.dp))
+
+    Field(vm, s("Wi-Fi name", "اسم الشبكة"), name, { name = it }, mono = true)
+    Field(vm, s("New password (leave empty to keep)", "كلمة السر الجديدة (اتركها فارغة للإبقاء)"),
+        pass, { pass = it }, mono = true, password = !showPass,
+        placeholder = "••••••••",
+        trailing = {
+            androidx.compose.material3.TextButton(onClick = { showPass = !showPass }) {
+                Text(if (showPass) s("Hide", "إخفاء") else s("Show", "إظهار"),
+                    fontFamily = tk.ui, fontSize = 12.sp, color = tk.accent)
+            }
+        })
+    if (pass.isNotBlank() && pass.length < 8) {
+        Text(s("Password must be at least 8 characters", "كلمة السر لازم 8 حروف على الأقل"),
+            fontFamily = tk.ui, fontSize = 12.sp, color = tk.bad,
+            modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp))
+    }
+
+    if (radios.size > 1) {
+        Text(s("Apply to", "طبّق على"), fontFamily = tk.ui, fontSize = 12.5.sp,
+            fontWeight = FontWeight.W600, color = tk.ink2, modifier = Modifier.padding(bottom = 6.dp))
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp),
+            modifier = Modifier.padding(bottom = 12.dp)) {
+            listOf("both" to s("Both", "الاثنين"), "2.4G" to "2.4 GHz", "5G" to "5 GHz")
+                .forEach { (key, label) ->
+                    val on = band == key
+                    Box(Modifier.weight(1f).clip(RoundedCornerShape(10.dp))
+                        .background(if (on) tk.accentSoft else tk.surface2)
+                        .clickable { band = key }.padding(vertical = 9.dp), Alignment.Center) {
+                        Text(label, fontFamily = tk.ui, fontSize = 13.sp,
+                            fontWeight = if (on) FontWeight.W700 else FontWeight.W500,
+                            color = if (on) tk.accent else tk.ink2)
+                    }
+                }
+        }
+    }
+
+    Spacer(Modifier.height(4.dp))
     Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
         GhostButton(s("Cancel", "إلغاء"), Modifier.weight(1f)) { setSheet(null) }
-        FilledSheetButton(s("Save & Restart", "حفظ وإعادة تشغيل"), Modifier.weight(1f), tk.accent, Color.White) {
-            if (name.isNotBlank() && name != sh.current) {
+        val changed = (name.isNotBlank() && name != sh.current) || pass.length >= 8
+        FilledSheetButton(
+            if (vm.wifiBusy) s("Saving…", "جاري الحفظ…") else s("Save", "حفظ"),
+            Modifier.weight(1f), tk.accent, Color.White
+        ) {
+            if (changed && !vm.wifiBusy && (pass.isBlank() || pass.length >= 8)) {
                 setSheet(null)
-                vm.applySsid(name.trim())
+                vm.applyWifi(
+                    ssid = name.trim().takeIf { it != sh.current },
+                    password = pass.takeIf { it.length >= 8 },
+                    bands = if (band == "both") null else setOf(band)
+                )
             }
         }
     }
@@ -1432,13 +1545,77 @@ private fun ColumnScope.ConfirmBody(vm: RouterViewModel, sh: Confirm, setSheet: 
 private fun ColumnScope.DeviceBody(vm: RouterViewModel, d: Device, setSheet: (Sheet?) -> Unit) {
     val tk = tk()
     fun s(en: String, ar: String) = tr(vm.lang, en, ar)
-    Text(d.name, fontFamily = tk.ui, fontWeight = FontWeight.W700, fontSize = 18.sp, color = tk.ink,
+    val macKey = d.mac.uppercase()
+    val alias = vm.deviceAlias[macKey]
+    Text(alias ?: d.name, fontFamily = tk.ui, fontWeight = FontWeight.W700, fontSize = 18.sp, color = tk.ink,
         modifier = Modifier.fillMaxWidth(), textAlign = TextAlign.Center, maxLines = 1, overflow = TextOverflow.Ellipsis)
+    if (alias != null && alias != d.name)
+        Text(d.name, fontFamily = tk.ui, fontSize = 11.sp, color = tk.ink3, textAlign = TextAlign.Center, modifier = Modifier.fillMaxWidth())
     Text(d.ip, fontFamily = tk.mono, fontSize = 12.sp, color = tk.ink2, textAlign = TextAlign.Center, modifier = Modifier.fillMaxWidth())
     Text(d.mac, fontFamily = tk.mono, fontSize = 11.sp, color = tk.ink3, textAlign = TextAlign.Center, modifier = Modifier.fillMaxWidth())
+
+    // link details, same numbers the router's own "Details" dialog shows
+    LaunchedEffect(macKey) { vm.refreshDevStats(force = true) }
+    vm.devStats[macKey]?.let { st ->
+        Spacer(Modifier.height(14.dp))
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            StatTile(Modifier.weight(1f), s("Signal", "الإشارة"),
+                st.rssiDbm?.let { "$it dBm" } ?: "—",
+                when { st.bars >= 3 -> tk.good; st.bars == 2 -> tk.warn; st.bars == 1 -> tk.bad; else -> tk.ink3 })
+            StatTile(Modifier.weight(1f), s("Link rate", "سرعة الاتصال"),
+                st.rateMbps?.let { "$it Mbps" } ?: "—", tk.indigo)
+            StatTile(Modifier.weight(1f), s("Online for", "متصل منذ"),
+                if (st.onlineMinutes <= 0) "—"
+                else (st.onlineMinutes / 60).let { h ->
+                    if (h > 0) "${h}h ${st.onlineMinutes % 60}m" else "${st.onlineMinutes}m"
+                }, tk.accent)
+        }
+        if (st.band.isNotBlank() && st.band != st.port) {
+            Spacer(Modifier.height(6.dp))
+            Text(s("Band", "النطاق") + ": " + st.band, fontFamily = tk.ui, fontSize = 11.5.sp,
+                color = tk.ink3, textAlign = TextAlign.Center, modifier = Modifier.fillMaxWidth())
+        }
+    }
     Spacer(Modifier.height(16.dp))
 
-    val macKey = d.mac.uppercase()
+    var editingName by remember(macKey) { mutableStateOf(false) }
+    var draft by remember(macKey) { mutableStateOf(alias ?: "") }
+    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+        Text(s("Custom name (app only)", "اسم مخصص (في التطبيق فقط)"),
+            fontFamily = tk.ui, fontWeight = FontWeight.W600, fontSize = 13.sp, color = tk.ink,
+            modifier = Modifier.weight(1f))
+        TextButton(onClick = { editingName = !editingName; draft = alias ?: "" }) {
+            Text(if (editingName) s("Cancel", "إلغاء") else s("Edit", "تعديل"),
+                fontFamily = tk.ui, fontSize = 12.sp, color = if (editingName) tk.ink3 else tk.accent)
+        }
+    }
+    if (editingName) {
+        OutlinedTextField(
+            value = draft, onValueChange = { draft = it }, singleLine = true,
+            placeholder = { Text(d.name, fontFamily = tk.ui, fontSize = 13.sp, color = tk.ink3) },
+            textStyle = androidx.compose.ui.text.TextStyle(fontFamily = tk.ui, fontSize = 14.sp, color = tk.ink),
+            shape = RoundedCornerShape(12.dp),
+            colors = OutlinedTextFieldDefaults.colors(
+                focusedBorderColor = tk.accent, unfocusedBorderColor = tk.line,
+                focusedContainerColor = tk.panel, unfocusedContainerColor = tk.panel,
+                cursorColor = tk.accent
+            ),
+            modifier = Modifier.fillMaxWidth()
+        )
+        Spacer(Modifier.height(8.dp))
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            GhostButton(s("Save", "حفظ"), Modifier.weight(1f)) {
+                vm.renameDevice(d.mac, draft); editingName = false
+            }
+            GhostButton(s("Reset to original", "إرجاع الاسم الأصلي"), Modifier.weight(1f)) {
+                vm.renameDevice(d.mac, ""); editingName = false; draft = ""
+            }
+        }
+        Spacer(Modifier.height(12.dp))
+    }
+
+    Spacer(Modifier.height(16.dp))
+
     // NOTE: the stored value is a STABLE key ("5"/"10"/"20"/"Max"), never a translated label,
     // otherwise switching language would make the lookup fail.
     val opts = listOf(
@@ -1589,6 +1766,13 @@ private fun RestartOverlay(vm: RouterViewModel) {
     }
 }
 
+/** "Go forward" chevron — mirrors itself when the locale is RTL (Arabic). */
+@Composable private fun Chevron(tint: Color, size: Dp = 18.dp) {
+    val rtl = LocalLayoutDirection.current == LayoutDirection.Rtl
+    Icon(WIcon.chevron, null, tint = tint,
+        modifier = Modifier.size(size).scale(scaleX = if (rtl) -1f else 1f, scaleY = 1f))
+}
+
 @Composable private fun Badge(text: String, fg: Color, bg: Color) {
     val tk = tk()
     Row(Modifier.clip(CircleShape).background(bg).padding(horizontal = 9.dp, vertical = 3.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -1615,16 +1799,190 @@ private fun RestartOverlay(vm: RouterViewModel) {
 
 @Composable private fun Divider2() { val tk = tk(); Box(Modifier.fillMaxWidth().height(1.dp).background(tk.line)) }
 
+@Composable
+private fun ColumnScope.GuestBody(vm: RouterViewModel, setSheet: (Sheet?) -> Unit) {
+    val tk = tk()
+    fun s(en: String, ar: String) = tr(vm.lang, en, ar)
+    val guest = vm.guestRadio
+    var name by remember { mutableStateOf(guest?.ssid ?: "Guest") }
+    var pass by remember { mutableStateOf("") }
+    var showPass by remember { mutableStateOf(false) }
+    var bands by remember { mutableStateOf(vm.guestBands.ifEmpty { setOf("2.4G") }) }
+    var confirmDelete by remember { mutableStateOf(false) }
+
+    Box(Modifier.align(Alignment.CenterHorizontally).size(52.dp).clip(RoundedCornerShape(16.dp))
+        .background(tk.goodSoft), Alignment.Center) {
+        Icon(WIcon.devices, null, tint = tk.good, modifier = Modifier.size(26.dp))
+    }
+    Spacer(Modifier.height(14.dp))
+    Text(s("Guest network", "شبكة الضيوف"), fontFamily = tk.ui, fontWeight = FontWeight.W700,
+        fontSize = 19.sp, color = tk.ink, modifier = Modifier.fillMaxWidth(), textAlign = TextAlign.Center)
+    Spacer(Modifier.height(8.dp))
+    Text(
+        if (guest == null)
+            s("Your router has no Guest Wi-Fi feature. This creates a second network with client isolation — guests get internet but cannot reach your devices.",
+              "الراوتر مفيهوش خاصية ضيوف جاهزة. ده بينشئ شبكة تانية بعزل الأجهزة — الضيوف يوصلوا للإنترنت بس مش لأجهزتك.")
+        else
+            s("A second network with client isolation. Guests reach the internet, not your devices.",
+              "شبكة تانية بعزل الأجهزة — الضيوف يوصلوا للإنترنت بس مش لأجهزتك."),
+        fontFamily = tk.ui, fontSize = 12.5.sp, color = tk.ink2, textAlign = TextAlign.Center,
+        modifier = Modifier.fillMaxWidth()
+    )
+    Spacer(Modifier.height(14.dp))
+
+    Field(vm, s("Network name", "اسم الشبكة"), name, { name = it }, mono = true)
+    Field(vm, if (guest == null) s("Password", "كلمة السر")
+              else s("New password (leave empty to keep)", "كلمة سر جديدة (فاضية = بدون تغيير)"),
+        pass, { pass = it }, mono = true, password = !showPass,
+        placeholder = "••••••••",
+        trailing = {
+            androidx.compose.material3.TextButton(onClick = { showPass = !showPass }) {
+                Text(if (showPass) s("Hide", "إخفاء") else s("Show", "إظهار"),
+                    fontFamily = tk.ui, fontSize = 13.sp,
+                    color = if (pass.isBlank()) tk.ink3 else tk.accent)
+            }
+        })
+    if (pass.isNotBlank() && pass.length < 8) {
+        Text(s("At least 8 characters", "8 حروف على الأقل"), fontFamily = tk.ui, fontSize = 12.sp,
+            color = tk.bad, modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp))
+    }
+
+    // both radios can carry the guest network at the same time - pick either or both
+    Text(s("Bands", "النطاقات"), fontFamily = tk.ui, fontSize = 12.5.sp,
+        fontWeight = FontWeight.W600, color = tk.ink2, modifier = Modifier.padding(bottom = 6.dp))
+    Row(horizontalArrangement = Arrangement.spacedBy(8.dp),
+        modifier = Modifier.padding(bottom = 4.dp)) {
+        listOf("2.4G" to "2.4 GHz", "5G" to "5 GHz").forEach { (key, label) ->
+            val on = key in bands
+            val exists = key in vm.guestBands
+            Box(Modifier.weight(1f).clip(RoundedCornerShape(10.dp))
+                .background(if (on) tk.accentSoft else tk.surface2)
+                .clickable {
+                    bands = if (on) bands - key else bands + key
+                }.padding(vertical = 9.dp), Alignment.Center) {
+                Text(label + if (exists) " ✓" else "", fontFamily = tk.ui, fontSize = 13.sp,
+                    fontWeight = if (on) FontWeight.W700 else FontWeight.W500,
+                    color = if (on) tk.accent else tk.ink2)
+            }
+        }
+    }
+    Text(s("✓ = already created", "✓ = متعملة بالفعل"), fontFamily = tk.ui, fontSize = 11.sp,
+        color = tk.ink3, modifier = Modifier.padding(bottom = 12.dp))
+
+    Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+        GhostButton(s("Cancel", "إلغاء"), Modifier.weight(1f)) { setSheet(null) }
+        FilledSheetButton(
+            when {
+                vm.wifiBusy -> s("Working…", "جاري التنفيذ…")
+                guest == null -> s("Create", "إنشاء")
+                else -> s("Save", "حفظ")
+            },
+            Modifier.weight(1f), tk.accent, Color.White
+        ) {
+            if (vm.wifiBusy || name.isBlank() || bands.isEmpty()) return@FilledSheetButton
+            if (pass.isNotBlank() && pass.length < 8) return@FilledSheetButton
+            val missing = bands - vm.guestBands
+            val dropped = vm.guestBands - bands
+            when {
+                guest == null -> {
+                    if (pass.length < 8) return@FilledSheetButton
+                    setSheet(null); vm.createGuest(name, pass, bands)
+                }
+                else -> {
+                    setSheet(null)
+                    if (dropped.isNotEmpty()) dropped.forEach { vm.deleteGuest(it) }
+                    if (missing.isNotEmpty()) vm.createGuest(name, pass.ifBlank { guest.password }, missing)
+                    if (name != guest.ssid || pass.length >= 8)
+                        vm.updateGuest(name.takeIf { it != guest.ssid }, pass.takeIf { it.length >= 8 })
+                }
+            }
+        }
+    }
+
+    if (guest != null) {
+        Spacer(Modifier.height(10.dp))
+        if (!confirmDelete) {
+            GhostButton(s("Remove guest network", "حذف شبكة الضيوف"), Modifier.fillMaxWidth()) {
+                confirmDelete = true
+            }
+        } else {
+            Text(s("Remove it? Guests will be disconnected.", "تحذفها؟ الضيوف هيتفصلوا."),
+                fontFamily = tk.ui, fontSize = 12.5.sp, color = tk.ink2,
+                textAlign = TextAlign.Center, modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                GhostButton(s("Keep", "إبقاء"), Modifier.weight(1f)) { confirmDelete = false }
+                FilledSheetButton(s("Remove", "حذف"), Modifier.weight(1f), tk.bad, Color.White) {
+                    setSheet(null); vm.deleteGuest()
+                }
+            }
+        }
+    }
+}
+
+/** One small labelled number in the device sheet. */
+@Composable private fun StatTile(modifier: Modifier, label: String, value: String, accent: Color) {
+    val tk = tk()
+    Column(modifier.clip(RoundedCornerShape(12.dp)).background(tk.surface3).padding(vertical = 10.dp),
+        horizontalAlignment = Alignment.CenterHorizontally) {
+        Text(value, fontFamily = tk.ui, fontWeight = FontWeight.W700, fontSize = 14.sp, color = accent,
+            maxLines = 1, overflow = TextOverflow.Ellipsis)
+        Spacer(Modifier.height(2.dp))
+        Text(label, fontFamily = tk.ui, fontSize = 10.5.sp, color = tk.ink3, maxLines = 1)
+    }
+}
+
+/** Signal / rate / uptime for one device — the numbers the router's own "Details" shows.
+ *  Renders nothing until the background fetch has them, so the list never waits. */
+@Composable private fun DevStatLine(vm: RouterViewModel, macKey: String) {
+    val tk = tk()
+    val st = vm.devStats[macKey] ?: return
+    fun s(en: String, ar: String) = tr(vm.lang, en, ar)
+    val parts = buildList {
+        st.rssiDbm?.let { add("$it dBm") }
+        st.rateMbps?.let { add("$it Mbps") }
+        if (st.onlineMinutes > 0) {
+            val h = st.onlineMinutes / 60
+            val m = st.onlineMinutes % 60
+            add(if (h > 0) "${h}h ${m}m" else "${m}m")
+        }
+        st.band.takeIf { it.isNotBlank() && it != st.port }?.let { add(it) }
+    }
+    if (parts.isEmpty()) return
+    Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(top = 2.dp)) {
+        if (st.rssiDbm != null) {
+            // four little bars, filled by signal strength
+            Row(verticalAlignment = Alignment.Bottom, horizontalArrangement = Arrangement.spacedBy(1.5.dp)) {
+                repeat(4) { i ->
+                    Box(
+                        Modifier.width(2.5.dp).height((4 + i * 2.5).dp).clip(RoundedCornerShape(1.dp))
+                            .background(
+                                if (i < st.bars) when {
+                                    st.bars >= 3 -> tk.good
+                                    st.bars == 2 -> tk.warn
+                                    else -> tk.bad
+                                } else tk.surface3
+                            )
+                    )
+                }
+            }
+            Spacer(Modifier.width(6.dp))
+        }
+        Text(parts.joinToString(" · "), fontFamily = tk.ui, fontSize = 11.sp, lineHeight = 12.5.sp,
+            color = tk.ink2, maxLines = 1, overflow = TextOverflow.Ellipsis)
+    }
+}
+
 @Composable private fun Field(
     vm: RouterViewModel, label: String, value: String, onChange: (String) -> Unit,
     mono: Boolean = false, password: Boolean = false, keyboard: KeyboardType = KeyboardType.Text,
-    trailing: (@Composable () -> Unit)? = null
+    placeholder: String? = null, trailing: (@Composable () -> Unit)? = null
 ) {
     val tk = tk()
     Column(Modifier.fillMaxWidth().padding(bottom = 12.dp)) {
         Text(label, fontFamily = tk.ui, fontSize = 12.5.sp, fontWeight = FontWeight.W600, color = tk.ink2, modifier = Modifier.padding(bottom = 6.dp))
         OutlinedTextField(
             value = value, onValueChange = onChange, singleLine = true,
+            placeholder = placeholder?.let { ph -> @Composable { Text(ph, fontFamily = tk.ui, fontSize = 14.sp, color = tk.ink3) } },
             visualTransformation = if (password) PasswordVisualTransformation() else VisualTransformation.None,
             trailingIcon = trailing,
             keyboardOptions = KeyboardOptions(keyboardType = keyboard),

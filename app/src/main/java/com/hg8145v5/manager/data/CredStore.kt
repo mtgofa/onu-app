@@ -118,4 +118,8 @@ class CredStore(context: Context) {
     var deviceCache: String
         get() = prefs.getString("device_cache", "")!!
         set(v) = prefs.edit().putString("device_cache", v).apply()
+
+    var aliases: String
+        get() = prefs.getString("aliases", "")!!
+        set(v) = prefs.edit().putString("aliases", v).apply()
 }

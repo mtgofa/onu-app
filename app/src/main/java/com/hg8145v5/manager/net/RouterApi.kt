@@ -40,6 +40,53 @@ data class Host(
     val online: Boolean
 )
 
+/** Live link stats for one device, as the WebUI's "Details" dialog shows them. */
+data class DevStat(
+    val mac: String,
+    val rssiDbm: Int?,        // null when offline / wired
+    val rateMbps: Int?,       // negotiated PHY rate
+    val onlineMinutes: Int,   // how long it has been connected
+    val port: String          // SSID1 / SSID5 / LAN…
+) {
+    val band: String get() = when {
+        port.equals("SSID5", true) -> "5G"
+        port.startsWith("SSID", true) -> "2.4G"
+        else -> port
+    }
+    /** 0..4 bars, the usual Wi-Fi thresholds. */
+    val bars: Int get() = when (val r = rssiDbm) {
+        null -> 0
+        else -> when {
+            r >= -55 -> 4
+            r >= -65 -> 3
+            r >= -75 -> 2
+            else -> 1
+        }
+    }
+}
+
+/** One Wi-Fi radio exactly as the router's own WlanBasic page describes it.
+ *  Read live from WlanBasic.asp, so a write can echo back every field the
+ *  firmware expects instead of guessing. */
+data class WlanRadio(
+    val domain: String,        // InternetGatewayDevice.LANDevice.1.WLANConfiguration.N
+    val band: String,          // "2.4G" / "5G"
+    val ifName: String,        // ath0 / ath4
+    val ssid: String,
+    val enabled: Boolean,
+    val advertised: Boolean,   // false = "Hide the network"
+    val deviceNum: String,     // X_HW_AssociateNum
+    val wmm: String,
+    val beaconType: String,    // WPAand11i / 11i / WPA ...
+    val authMode: String,      // PSKAuthentication ...
+    val encModes: String,      // TKIPandAESEncryption ...
+    val rekey: String,         // X_HW_GroupRekey seconds
+    val password: String       // current PSK (the page ships it in clear)
+) {
+    val instance: String get() = domain.substringAfterLast('.')
+    val pskNode: String get() = "$domain.PreSharedKey.1"
+}
+
 /**
  * Low-level client for the Huawei HG8145V5 (TEDATA firmware).
  * Verified live: login flow, session cookie, .asp reads, setajax.cgi writes, cfgfiledown.
@@ -150,6 +197,7 @@ class RouterApi(
     fun getPage(path: String): String {
         val req = Request.Builder().url("$base/$path")
             .header("Cookie", sessionCookie ?: throw SessionExpired())
+            .header("Referer", "$base/html/amp/wlanbasic/WlanBasic.asp?2G")
             .get().build()
         client.newCall(req).execute().use { resp ->
             val body = resp.body?.string().orEmpty()
@@ -169,8 +217,9 @@ class RouterApi(
         // The router's live table only remembers ~8 recent rows. Its full connection history
         // lives in <hostsInstance> inside hw_ctree.xml — merge those in (best-effort) so
         // previously-connected devices stay visible even after the router forgets them.
+        // The 207KB config is expensive: re-download it at most every 5 min.
         val now = System.currentTimeMillis()
-        if (now - lastFullDevFetch > 30_000) {
+        if (now - lastFullDevFetch > 300_000) {
             lastFullDevFetch = now
             try {
                 for (h in hostsFromConfig())
@@ -180,6 +229,36 @@ class RouterApi(
             } catch (e: Exception) { /* history is best-effort */ }
         }
         return out.values.toList()
+    }
+
+    /**
+     * RSSI / negotiated rate / online duration for every device — the numbers behind the
+     * WebUI's "Details" button. One page holds them all:
+     *
+     *   new USERDev(Domain, IpAddr, MacAddr, PortID, IpType, DevType, DevStatus, PortType,
+     *               time, HostName, RSSI, NegotiatedRate)
+     *
+     * `time` is "H:MM" of connection time; offline rows carry RSSI/rate "0".
+     * Keyed by upper-case MAC.
+     */
+    fun deviceStats(): Map<String, DevStat> {
+        val html = getPage(DEV_DETAIL_PAGE)
+        val out = LinkedHashMap<String, DevStat>()
+        for (m in Regex("""new\s+USERDev\((.*?)\)""").findAll(html)) {
+            val a = splitJsArgs(m.groupValues[1]).map { unescapeHx(it) }
+            if (a.size < 12) continue
+            val mac = a[2].uppercase().takeIf { it.isNotBlank() } ?: continue
+            val online = a[6].equals("Online", true)
+            val rssi = a[10].toIntOrNull()?.takeIf { online && it != 0 }
+            val rate = a[11].toIntOrNull()?.takeIf { online && it != 0 }
+            val dur = a[8].split(":").let { p ->
+                val h = p.getOrNull(0)?.trim()?.toIntOrNull() ?: 0
+                val mi = p.getOrNull(1)?.trim()?.toIntOrNull() ?: 0
+                h * 60 + mi
+            }
+            out[mac] = DevStat(mac, rssi, rate, dur, a[3])   // the page repeats the array; last wins
+        }
+        return out
     }
 
     private fun parseDevicePage(page: String): List<Device> {
@@ -262,6 +341,41 @@ class RouterApi(
                     WriteResult.ParamError(Regex("""ErrCode\s*=\s*"([^"]+)"""").find(body)!!.groupValues[1])
                 resp.code == 200 -> WriteResult.Success
                 else -> WriteResult.Failed("http ${resp.code}")
+            }
+        }
+    }
+
+    /**
+     * Like [htmlWrite] but the caller supplies the whole query string, because some
+     * WebUI pages address several nodes at once (the WLAN save uses y / k / c1 / c2 / w).
+     */
+    fun cgiWrite(
+        cgi: String,
+        query: String,
+        page: String,
+        params: Map<String, String>,
+        requestFile: String = page.substringBefore('?')   // ?2G in RequestFile => 404 after the write
+    ): WriteResult {
+        val token = tokenFrom(page) ?: return WriteResult.Failed("no token")
+        val fb = FormBody.Builder()
+        params.forEach { (k, v) -> fb.add(k, v) }
+        fb.add("x.X_HW_Token", token)
+        val req = Request.Builder()
+            .url(if (query.isBlank()) "$base/$cgi?RequestFile=$requestFile"
+                 else "$base/$cgi?$query&RequestFile=$requestFile")
+            .header("Cookie", sessionCookie ?: return WriteResult.Failed("no session"))
+            .header("Referer", "$base/$page")
+            .post(fb.build()).build()
+        client.newCall(req).execute().use { resp ->
+            val body = resp.body?.string().orEmpty()
+            if (body.contains("Waiting...")) throw SessionExpired()
+            val err = Regex("""ErrCode\s*=\s*"([^"]+)"""").find(body)?.groupValues?.get(1)
+            return when {
+                err == null -> if (resp.code == 200) WriteResult.Success
+                              else WriteResult.Failed("http ${resp.code}")
+                err == "0x0" -> WriteResult.Success
+                err == "0x1" -> WriteResult.Denied(err)
+                else -> WriteResult.ParamError(err)
             }
         }
     }
@@ -427,6 +541,193 @@ class RouterApi(
         return out.toList()
     }
 
+    // ---- Wi-Fi: live read + live write (no config file, no reboot) ----
+    /**
+     * Both radios as the WebUI sees them. WlanBasic.asp ships them as a JS array:
+     *
+     *   var WlanArr = new Array(new stWlan("…WLANConfiguration.1","ath0","1","WE_A8C715","1",
+     *                 "32","1","WPAand11i",…), new stWlan("…WLANConfiguration.5","ath4",…), null);
+     *   var wpaPskKey = new Array(new stPreSharedKey("…WLANConfiguration.1.PreSharedKey.1",
+     *                 "<psk>",""), …);
+     *
+     * Field order comes from the page's own stWlan() constructor.
+     */
+    fun wlanRadios(): List<WlanRadio> {
+        val html = getPage(WLAN_PAGE + "?2G")
+        val keys = Regex("""new\s+stPreSharedKey\((.*?)\)""").findAll(html).mapNotNull { m ->
+            val a = splitJsArgs(m.groupValues[1]).map { unescapeHx(it) }
+            if (a.size >= 2) a[0] to a[1] else null
+        }.toMap()
+        return Regex("""new\s+stWlan\((.*?)\)""").findAll(html).mapNotNull { m ->
+            val a = splitJsArgs(m.groupValues[1]).map { unescapeHx(it) }
+            if (a.size < 24) return@mapNotNull null
+            val domain = a[0]
+            if (!domain.contains("WLANConfiguration.")) return@mapNotNull null
+            WlanRadio(
+                domain = domain,
+                // LowerLayers ends in WiFi.Radio.1 (2.4 GHz) or .2 (5 GHz)
+                band = if (a[23].endsWith(".2")) "5G" else "2.4G",
+                ifName = a[1],
+                ssid = a[3],
+                enabled = a[2] == "1",
+                advertised = a[4] == "1",
+                deviceNum = a[5],
+                wmm = a[6],
+                beaconType = a[7],
+                authMode = when (a[7]) {
+                    "11i" -> a[15]                     // IEEE11iAuthenticationMode
+                    "WPA" -> a[13]                     // WPAAuthenticationMode
+                    else -> a[17]                      // X_HW_WPAand11iAuthenticationMode
+                },
+                encModes = when (a[7]) {
+                    "11i" -> a[14]
+                    "WPA" -> a[12]
+                    else -> a[16]
+                },
+                rekey = a[18],
+                password = keys["$domain.PreSharedKey.1"].orEmpty()
+            )
+        }.distinctBy { it.domain }.toList()
+    }
+
+    /**
+     * Change a radio's name / password live — the same call the WebUI's Save button makes,
+     * so it applies immediately and the router does NOT reboot (only that radio re-associates).
+     *
+     * The page (CfgMode TEDATA2, HiLinkRoll=1) addresses five nodes at once:
+     *   y  = the WLANConfiguration instance          k  = its PreSharedKey.1
+     *   w  = WifiCoverSetWlanBasic (mesh sync)       c1/c2 = WLANConfigAction begin/commit
+     * Security fields are echoed back from [radio] so nothing else changes.
+     */
+    fun setWifi(
+        radio: WlanRadio,
+        ssid: String = radio.ssid,
+        password: String = radio.password,
+        advertised: Boolean = radio.advertised,
+        enabled: Boolean = radio.enabled
+    ): WriteResult {
+        val d = radio.domain
+        val query = buildString {
+            append("c1=").append(CFG_ACTION)
+            append("&w=").append(WIFI_COVER_NODE)
+            append("&y=").append(d)
+            append("&k=").append(radio.pskNode)
+            append("&c2=").append(CFG_ACTION)
+        }
+        val params = linkedMapOf(
+            "y.Enable" to if (enabled) "1" else "0",
+            "y.SSID" to ssid,
+            "y.SSIDAdvertisementEnabled" to if (advertised) "1" else "0",
+            "y.WMMEnable" to radio.wmm,
+            "y.X_HW_AssociateNum" to radio.deviceNum,
+            "y.BeaconType" to radio.beaconType,
+            "y.X_HW_GroupRekey" to radio.rekey,
+            "k.PreSharedKey" to password,
+            "c1.ActionType" to "0",
+            "c2.ActionType" to "1",
+            "c2.SSIDList" to radio.instance
+        )
+        // the auth/encryption pair is named after the beacon type
+        when (radio.beaconType) {
+            "11i" -> {
+                params["y.IEEE11iAuthenticationMode"] = radio.authMode
+                params["y.IEEE11iEncryptionModes"] = radio.encModes
+            }
+            "WPA" -> {
+                params["y.WPAAuthenticationMode"] = radio.authMode
+                params["y.WPAEncryptionModes"] = radio.encModes
+            }
+            else -> {
+                params["y.X_HW_WPAand11iAuthenticationMode"] = radio.authMode
+                params["y.X_HW_WPAand11iEncryptionModes"] = radio.encModes
+            }
+        }
+        return cgiWrite("set.cgi", query, "$WLAN_PAGE?2G", params)
+    }
+
+    // ---- extra / guest SSIDs ----
+    /**
+     * Add a second network on [band] — this firmware (TEDATA2) has no Guest Wi-Fi page of its
+     * own, so a guest network here is an extra WLANConfiguration instance with client
+     * isolation turned on: its clients reach the internet but not each other or the LAN.
+     *
+     * addcfg.cgi addresses the *container*, and the router picks the next free instance
+     * (2..4 on 2.4 GHz, 6..8 on 5 GHz). It carries no PreSharedKey alias, so the password is
+     * set by a normal [setWifi] on the new instance right afterwards.
+     */
+    fun addSsid(band: String, ssid: String, isolate: Boolean = true): WriteResult {
+        val radio = if (band == "5G") "InternetGatewayDevice.LANDevice.1.WiFi.Radio.2"
+                    else "InternetGatewayDevice.LANDevice.1.WiFi.Radio.1"
+        val params = linkedMapOf(
+            "y.Enable" to "1",
+            "y.SSID" to ssid,
+            "y.SSIDAdvertisementEnabled" to "1",
+            "y.WMMEnable" to "1",
+            "y.LowerLayers" to radio,
+            "y.X_HW_AssociateNum" to "32",
+            "y.BeaconType" to "11i",
+            "y.IEEE11iAuthenticationMode" to "PSKAuthentication",
+            "y.IEEE11iEncryptionModes" to "AESEncryption",
+            "y.X_HW_GroupRekey" to "3600",
+            "y.IsolationEnable" to if (isolate) "1" else "0"
+        )
+        return cgiWrite("addcfg.cgi",
+            "y=InternetGatewayDevice.LANDevice.1.WLANConfiguration", "$WLAN_PAGE?2G", params)
+    }
+
+    /**
+     * Flip the per-SSID extras that live on its X_HW_AttachConf child. The firmware keeps the
+     * real guest switch there — every WLANConfigurationInstance in hw_ctree.xml carries
+     *
+     *   <X_HW_AttachConf … X_HW_IsolationEnable="0" X_HW_PortIsolation="0"
+     *                      X_HW_GuestNetwork="0" GuestValidTime="0" GuestRestTime="0" …/>
+     *
+     * The WebUI addresses this node as q=<domain>.X_HW_AttachConf and already writes
+     * q.X_HW_IsolationEnable / q.X_HW_UpRateLimit to it, so the path is the vendor's own —
+     * X_HW_GuestNetwork is simply an attribute its page never exposes.
+     *
+     * [validMinutes]/[restMinutes] are the firmware's guest time limits; 0 = no limit.
+     */
+    fun setAttachConf(
+        domain: String,
+        guestNetwork: Boolean? = null,
+        isolate: Boolean? = null,
+        validMinutes: Int? = null,
+        restMinutes: Int? = null,
+        upKbps: Int? = null,
+        downKbps: Int? = null
+    ): WriteResult {
+        val params = linkedMapOf<String, String>()
+        guestNetwork?.let { params["q.X_HW_GuestNetwork"] = if (it) "1" else "0" }
+        isolate?.let {
+            params["q.X_HW_IsolationEnable"] = if (it) "1" else "0"
+            params["q.X_HW_PortIsolation"] = if (it) "1" else "0"
+        }
+        validMinutes?.let { params["q.GuestValidTime"] = it.toString() }
+        restMinutes?.let { params["q.GuestRestTime"] = it.toString() }
+        upKbps?.let { params["q.X_HW_UpRateLimit"] = it.toString() }
+        downKbps?.let { params["q.X_HW_DownRateLimit"] = it.toString() }
+        if (params.isEmpty()) return WriteResult.Failed("nothing to set")
+        return cgiWrite("set.cgi", "q=$domain.X_HW_AttachConf", "$WLAN_PAGE?2G", params)
+    }
+
+    /**
+     * Remove SSID instances. The WebUI does this in two steps and only the pair works:
+     *   1. set.cgi ParallelDelSsid with y.DeleteInstArray = "2,6"  (tell the radios)
+     *   2. del.cgi with one empty field *named* after each instance domain (do the delete)
+     * Sending only the first leaves the SSID in place, which is why Remove looked dead.
+     */
+    fun deleteSsids(domains: List<String>): WriteResult {
+        if (domains.isEmpty()) return WriteResult.Failed("nothing to delete")
+        val instances = domains.map { it.substringAfterLast('.') }
+        val step1 = cgiWrite("set.cgi",
+            "y=InternetGatewayDevice.X_HW_DEBUG.AMP.ParallelDelSsid", "$WLAN_PAGE?2G",
+            mapOf("y.DeleteInstArray" to instances.joinToString(",")))
+        if (step1 is WriteResult.Denied) return step1
+        return cgiWrite("del.cgi", "", "$WLAN_PAGE?2G",
+            domains.associateWith { "" })
+    }
+
     /** Reboot — VERIFIED node from reset.asp (Reboot() -> set.cgi ResetBoard, token only). */
     fun reboot(): Boolean = try {
         htmlWrite("set.cgi", "InternetGatewayDevice.X_HW_DEBUG.SMP.DM.ResetBoard",
@@ -545,6 +846,11 @@ class RouterApi(
 
     companion object {
         const val MAC_FILTER_PAGE = "html/bbsp/macfilter/macfilter.asp"
+        const val WLAN_PAGE = "html/amp/wlanbasic/WlanBasic.asp"
+        const val DEV_DETAIL_PAGE = "html/bbsp/userdevinfo/userdetdevinfo.asp"
+        private const val CFG_ACTION = "InternetGatewayDevice.X_HW_DEBUG.WLANConfigAction"
+        private const val WIFI_COVER_NODE =
+            "InternetGatewayDevice.X_HW_DEBUG.AMP.WifiCoverSetWlanBasic"
         private const val CONFIG_CACHE_TTL = 5 * 60 * 1000L
     }
 }

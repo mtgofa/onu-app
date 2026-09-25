@@ -22,8 +22,8 @@ android {
         applicationId = "com.hg8145v5.manager"
         minSdk = 24
         targetSdk = 34
-        versionCode = 11
-        versionName = "1.0.2"
+        versionCode = 13
+        versionName = "1.1.1"
         vectorDrawables { useSupportLibrary = true }
         // auto-update source (GitHub Releases latest). Works for a PUBLIC repo without any
         // token; leave empty to disable. The release "name" must carry " (code N)".

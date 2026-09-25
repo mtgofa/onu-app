@@ -48,7 +48,8 @@ fun fetchRouterModel(ip: String): String? {
         .readTimeout(8, TimeUnit.SECONDS)
         .build()
     for (scheme in listOf("https", "http")) {
-        val req = Request.Builder().url("$scheme://$ip/").get().build()
+        val req = runCatching { Request.Builder().url("$scheme://$ip/").get().build() }
+            .getOrNull() ?: continue
         val html = runCatching { client.newCall(req).execute().use { r ->
             if (r.isSuccessful) r.body?.string().orEmpty() else ""
         } }.getOrDefault("")

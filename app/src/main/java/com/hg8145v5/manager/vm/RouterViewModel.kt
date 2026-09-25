@@ -13,6 +13,7 @@ import com.hg8145v5.manager.data.CredStore
 import com.hg8145v5.manager.data.Creds
 import com.hg8145v5.manager.net.AppRelease
 import com.hg8145v5.manager.net.Bloom
+import com.hg8145v5.manager.net.DevStat
 import com.hg8145v5.manager.net.Device
 import com.hg8145v5.manager.net.DnsResult
 import com.hg8145v5.manager.net.MtuProbe
@@ -22,6 +23,7 @@ import com.hg8145v5.manager.net.PingStats
 import com.hg8145v5.manager.net.RouterApi
 import com.hg8145v5.manager.net.SpeedCheck
 import com.hg8145v5.manager.net.WifiLink
+import com.hg8145v5.manager.net.WlanRadio
 import com.hg8145v5.manager.net.WriteResult
 import com.hg8145v5.manager.net.UpdateCheck
 import android.content.Intent
@@ -65,6 +67,7 @@ class RouterViewModel(app: Application) : AndroidViewModel(app) {
     val devices = mutableStateListOf<Device>()
     var deviceCount by mutableStateOf(0); private set
     val speedLabel = mutableStateMapOf<String, String>()   // mac(upper) -> "5"/"10"/"20"/"Max"
+    val deviceAlias = mutableStateMapOf<String, String>()  // mac(upper) -> user's custom name (app-only)
 
     // last successful device fetch — gates how often refresh() actually re-poll the router
     private var lastDevicesFetch = 0L
@@ -119,6 +122,10 @@ class RouterViewModel(app: Application) : AndroidViewModel(app) {
         store.speeds.split(',').filter { it.contains('=') }.forEach {
             val (m, l) = it.split('=', limit = 2); if (m.isNotBlank()) speedLabel[m] = l
         }
+        // restore custom device names (app-only aliases)
+        store.aliases.split(',').filter { it.contains('=') }.forEach {
+            val (m, n) = it.split('=', limit = 2); if (m.isNotBlank()) deviceAlias[m] = n
+        }
 
         // show the last known devices instantly (stored locally — no router round-trip),
         // the background polling refreshes them while the user is on the page.
@@ -170,6 +177,8 @@ class RouterViewModel(app: Application) : AndroidViewModel(app) {
      *  - an empty/partial read never wipes the current list,
      *  - devices that were known before but aren't in the live table stay visible (as offline),
      *  - the merged snapshot is persisted locally so it survives restarts.
+     * State is only touched when the data actually changed — identical polls leave the UI alone
+     * (no recomposition, no disk writes), which keeps scrolling smooth.
      */
     private suspend fun fetchDevices(): Boolean = try {
         val list = withSession { api.getDevices() }
@@ -179,24 +188,33 @@ class RouterViewModel(app: Application) : AndroidViewModel(app) {
             for (d in list) merged[d.mac.uppercase()] = d
             for ((mac, d) in prev) if (mac !in merged) merged[mac] = d.copy(online = false)
             val final = merged.values.toList()
-            devices.clear(); devices.addAll(final)
-            deviceCount = list.count { it.online }
             lastDevicesFetch = System.currentTimeMillis()
-            store.deviceCache = encodeDevices(final)
+            if (final != devices) {
+                devices.clear(); devices.addAll(final)
+                deviceCount = list.count { it.online }
+                store.deviceCache = encodeDevices(final)
+            }
         }
         // blocked list is live state — refresh separately; failures keep the previous view
         runCatching { withSession { api.macFilterList() } }.getOrNull()?.let { l ->
-            blocked.clear(); l.forEach { blocked[it.mac] = it.domain }
+            val fresh = l.associate { it.mac to it.domain }
+            if (fresh != blocked.toMap()) {
+                blocked.clear(); fresh.forEach { (m, dom) -> blocked[m] = dom }
+            }
         }
         true
     } catch (e: Exception) { false }
 
-    /** Light entrada gate: skip the network when we just fetched (<15s ago) so switching
+    /** Light entrada gate: skip the network when we just fetched (<1 min ago) so switching
      *  Devices tabs / pages never re-downloads the config or blanks the list. */
     fun refresh() {
-        if (conn == Conn.Connected && System.currentTimeMillis() - lastDevicesFetch < 15_000) return
-        viewModelScope.launch { conn = if (fetchDevices()) Conn.Connected else Conn.Disconnected }
+        if (conn == Conn.Connected && System.currentTimeMillis() - lastDevicesFetch < 60_000) return
+        viewModelScope.launch {
+            val newConn = if (fetchDevices()) Conn.Connected else Conn.Disconnected
+            if (newConn != conn) conn = newConn
+        }
         loadStatus()
+        refreshDevStats()
     }
 
     private fun loadStatus() {
@@ -208,6 +226,29 @@ class RouterViewModel(app: Application) : AndroidViewModel(app) {
             runCatching { api.productName() }.getOrNull()?.takeIf { it.isNotBlank() }?.let { routerModel = it }
         }
         loadConfigInfo()
+    }
+
+    // ---- per-device link stats (RSSI / rate / online duration) ----
+    /** MAC(upper) -> live link stats, refreshed in the background. */
+    var devStats by mutableStateOf(mapOf<String, DevStat>()); private set
+    private var lastStatsFetch = 0L
+
+    /**
+     * Pull RSSI / negotiated rate / online time for every device.
+     *
+     * Runs on its own coroutine and never blocks the device list: the list renders from
+     * [devices] as soon as it arrives and the numbers fill in a moment later. Throttled to
+     * one fetch per 20 s so scrolling or tab switches never hit the router.
+     */
+    fun refreshDevStats(force: Boolean = false) {
+        val now = System.currentTimeMillis()
+        if (!force && now - lastStatsFetch < 20_000) return
+        lastStatsFetch = now
+        viewModelScope.launch {
+            runCatching { withSession { api.deviceStats() } }
+                .onSuccess { if (it.isNotEmpty()) devStats = it }
+                .onFailure { lastStatsFetch = 0L }      // let the next beat retry
+        }
     }
 
     private var beat = 0
@@ -223,6 +264,7 @@ class RouterViewModel(app: Application) : AndroidViewModel(app) {
             val ok = fetchDevices()
             conn = if (ok) Conn.Connected else Conn.Disconnected
             if (ok && (++beat % 4 == 0)) loadStatus()
+            refreshDevStats()          // cheap, and off the device-list path
         }
     }
 
@@ -533,8 +575,194 @@ class RouterViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    /** Rename the Wi-Fi network (all enabled radios get the same name), then restart. */
-    fun applySsid(newName: String) {
+    // ---- Wi-Fi name / password: live, no config file, no reboot ----
+    /** Both radios as the router reports them right now (empty until [loadWlanRadios]). */
+    var wlanLive by mutableStateOf(listOf<WlanRadio>()); private set
+
+    /** True while a live Wi-Fi write is in flight. */
+    var wifiBusy by mutableStateOf(false); private set
+
+    /** Refresh [wlanLive] from WlanBasic.asp. Cheap enough to call when the sheet opens. */
+    fun loadWlanRadios(onDone: (() -> Unit)? = null) {
+        viewModelScope.launch {
+            runCatching { withSession { api.wlanRadios() } }
+                .onSuccess { if (it.isNotEmpty()) wlanLive = it }
+            onDone?.invoke()
+        }
+    }
+
+    /**
+     * Change the Wi-Fi name and/or password on the router straight away.
+     *
+     * This is the WebUI's own Save call (set.cgi on the WLANConfiguration instance), so it
+     * applies in a second or two and the router does NOT reboot — only the radios you touch
+     * drop their clients. Pass [bands] = null for every enabled radio.
+     *
+     * The old route (download hw_ctree.xml, edit, upload, reboot) is kept in [applySsidViaConfig]
+     * as a fallback for firmware that refuses the live write.
+     */
+    fun applyWifi(
+        ssid: String? = null,
+        password: String? = null,
+        hidden: Boolean? = null,
+        bands: Set<String>? = null
+    ) {
+        viewModelScope.launch {
+            wifiBusy = true
+            val res = runCatching {
+                withSession {
+                    val radios = api.wlanRadios().also { if (it.isNotEmpty()) wlanLive = it }
+                    val targets = radios.filter { it.enabled && (bands == null || it.band in bands) }
+                    if (targets.isEmpty()) return@withSession "no-radio"
+                    var failure: String? = null
+                    for (r in targets) {
+                        val w = api.setWifi(
+                            radio = r,
+                            ssid = ssid?.trim()?.takeIf { it.isNotBlank() } ?: r.ssid,
+                            password = password?.takeIf { it.isNotBlank() } ?: r.password,
+                            advertised = hidden?.let { !it } ?: r.advertised
+                        )
+                        if (w !is WriteResult.Success) {
+                            failure = when (w) {
+                                is WriteResult.Denied -> "denied ${w.code}"
+                                is WriteResult.ParamError -> "rejected ${w.code}"
+                                is WriteResult.Failed -> w.reason
+                                else -> "error"
+                            }
+                            break
+                        }
+                    }
+                    failure
+                }
+            }.getOrElse { it.message ?: "error" }
+            wifiBusy = false
+            if (res == null) {
+                toast(t("Wi-Fi updated — reconnect with the new settings",
+                        "تم تحديث الواي فاي — أعد الاتصال بالإعدادات الجديدة"))
+                ssid?.trim()?.takeIf { it.isNotBlank() }?.let { ssids = listOf(it) }
+                loadWlanRadios()
+            } else {
+                toast(t("Could not apply", "تعذّر التطبيق") + " ($res)")
+            }
+        }
+    }
+
+    // ---- guest network ----
+    /**
+     * The guest network, if one exists. This firmware has no Guest Wi-Fi feature, so "guest"
+     * means an extra SSID next to the main one on the same radio, with client isolation on.
+     * Instance 1 (2.4 GHz) and 5 (5 GHz) are the primaries; anything else is extra.
+     */
+    val guestRadios: List<WlanRadio> get() = wlanLive.filter { it.instance !in setOf("1", "5") }
+
+    /** The one to show when a single radio is enough (name, password…). */
+    val guestRadio: WlanRadio? get() = guestRadios.firstOrNull()
+
+    /** Bands that already have a guest network. */
+    val guestBands: Set<String> get() = guestRadios.map { it.band }.toSet()
+
+    /** True once we've actually read the radios — until then "no guest" is just "unknown". */
+    val guestKnown: Boolean get() = wlanLive.isNotEmpty()
+
+    /** Create the guest network: add the SSID, then set its password on the new instance. */
+    fun createGuest(name: String, password: String, bands: Set<String> = setOf("2.4G")) {
+        viewModelScope.launch {
+            wifiBusy = true
+            var isolationRefused = false
+            val err = runCatching {
+                withSession {
+                    for (band in bands.sorted()) {                 // 2.4G first, then 5G
+                        if (band in guestBands) continue           // already there
+                        val before = api.wlanRadios().map { it.domain }.toSet()
+                        val add = api.addSsid(band, name.trim(), isolate = true)
+                        if (add !is WriteResult.Success) return@withSession writeError(add)
+                        // the new instance has no key yet — a normal save puts one on it
+                        val fresh = api.wlanRadios().also { wlanLive = it }
+                        val made = fresh.firstOrNull { it.domain !in before }
+                            ?: return@withSession "created, but not visible yet"
+                        if (password.isNotBlank()) {
+                            val set = api.setWifi(made, ssid = name.trim(), password = password)
+                            if (set !is WriteResult.Success) return@withSession writeError(set)
+                        }
+                        // the firmware's own guest switch lives on the SSID's X_HW_AttachConf child
+                        if (api.setAttachConf(made.domain, guestNetwork = true, isolate = true)
+                                !is WriteResult.Success) isolationRefused = true
+                    }
+                    null
+                }
+            }.getOrElse { it.message ?: "error" }
+            wifiBusy = false
+            when {
+                err != null -> toast(t("Could not create", "تعذّر الإنشاء") + " ($err)")
+                isolationRefused -> toast(t("Created, but guest isolation was refused",
+                                            "اتعملت، بس عزل الضيوف اترفض"))
+                else -> toast(t("Guest network created", "تم إنشاء شبكة الضيوف"))
+            }
+            loadWlanRadios()
+        }
+    }
+
+    /** Turn the guest network on or off without deleting it. */
+    fun setGuestEnabled(on: Boolean) {
+        val gs = guestRadios.ifEmpty { return }
+        viewModelScope.launch {
+            wifiBusy = true
+            val err = runCatching {
+                withSession { gs.firstNotNullOfOrNull { writeError(api.setWifi(it, enabled = on)) } }
+            }.getOrElse { it.message ?: "error" }
+            wifiBusy = false
+            if (err == null) {
+                toast(if (on) t("Guest network on", "شبكة الضيوف مفعّلة")
+                      else t("Guest network off", "شبكة الضيوف متوقفة"))
+                loadWlanRadios()
+            } else toast(t("Could not apply", "تعذّر التطبيق") + " ($err)")
+        }
+    }
+
+    /** Change the guest network's name / password. */
+    fun updateGuest(name: String?, password: String?) {
+        val gs = guestRadios.ifEmpty { return }
+        viewModelScope.launch {
+            wifiBusy = true
+            val err = runCatching {
+                withSession {
+                    gs.firstNotNullOfOrNull { g ->
+                        writeError(api.setWifi(g,
+                            ssid = name?.trim()?.takeIf { it.isNotBlank() } ?: g.ssid,
+                            password = password?.takeIf { it.isNotBlank() } ?: g.password))
+                    }
+                }
+            }.getOrElse { it.message ?: "error" }
+            wifiBusy = false
+            if (err == null) { toast(t("Guest network updated", "تم تحديث شبكة الضيوف")); loadWlanRadios() }
+            else toast(t("Could not apply", "تعذّر التطبيق") + " ($err)")
+        }
+    }
+
+    /** Remove the guest network entirely. */
+    fun deleteGuest(band: String? = null) {
+        val gs = guestRadios.filter { band == null || it.band == band }.ifEmpty { return }
+        viewModelScope.launch {
+            wifiBusy = true
+            val err = runCatching {
+                withSession { writeError(api.deleteSsids(gs.map { it.domain })) }
+            }.getOrElse { it.message ?: "error" }
+            wifiBusy = false
+            if (err == null) { toast(t("Guest network removed", "تم حذف شبكة الضيوف")); loadWlanRadios() }
+            else toast(t("Could not remove", "تعذّر الحذف") + " ($err)")
+        }
+    }
+
+    private fun writeError(w: WriteResult): String? = when (w) {
+        is WriteResult.Success -> null
+        is WriteResult.Denied -> "denied ${w.code}"
+        is WriteResult.ParamError -> "rejected ${w.code}"
+        is WriteResult.Failed -> w.reason
+    }
+
+    /** Rename the Wi-Fi network (all enabled radios get the same name), then restart.
+     *  Legacy fallback — [applyWifi] does the same thing live, without a reboot. */
+    fun applySsidViaConfig(newName: String) {
         configThenReboot(t("Applying Wi-Fi name…", "جاري تطبيق اسم الشبكة…"),
             t("Wi-Fi name updated", "تم تحديث اسم الشبكة")) { xml ->
             var touched = false
@@ -557,6 +785,13 @@ class RouterViewModel(app: Application) : AndroidViewModel(app) {
         configThenReboot(t("Applying speed limit…", "جاري تطبيق السرعة…"), t("Speed limit applied", "تم تطبيق السرعة")) { xml ->
             editAttachControl(xml, mac.uppercase(), kbpsUp, kbpsDown)
         }
+    }
+
+    /** Custom device name shown in the app only (never written to the router). */
+    fun renameDevice(mac: String, alias: String) {
+        val key = mac.uppercase()
+        if (alias.isBlank()) deviceAlias.remove(key) else deviceAlias[key] = alias.trim()
+        store.aliases = deviceAlias.entries.joinToString(",") { "${it.key}=${it.value}" }
     }
 
     private fun configThenReboot(applyMsg: String, okMsg: String, edit: (String) -> String) {
