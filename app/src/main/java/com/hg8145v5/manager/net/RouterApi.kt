@@ -69,6 +69,18 @@ class RouterApi(
     }
 
     fun setCredentials(user: String, pass: String) { username = user; password = pass }
+
+    /** Usable without an active session: the router's login page publishes the model in plain JS. */
+    fun productName(): String? {
+        val req = Request.Builder().url("$base/").get().build()
+        return runCatching {
+            client.newCall(req).execute().use { resp ->
+                if (!resp.isSuccessful) return@use null
+                Regex("""(?i)ProductName\s*=\s*['\"]([^'\"]+)['\"]""")
+                    .find(resp.body?.string().orEmpty())?.groupValues?.get(1)?.trim()
+            }
+        }.getOrNull()
+    }
     fun hasSession() = sessionCookie != null
     fun clearSession() { sessionCookie = null }
 

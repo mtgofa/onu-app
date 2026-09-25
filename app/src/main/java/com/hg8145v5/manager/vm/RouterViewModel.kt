@@ -49,6 +49,8 @@ class RouterViewModel(app: Application) : AndroidViewModel(app) {
 
     private val store = CredStore(app)
     private var api = RouterApi()
+    var routerHost by mutableStateOf("")
+    var routerModel by mutableStateOf("")
     private val net = NetworkMonitor(app)
 
     /** bumped every time Wi-Fi comes back, so waiting loops can retry immediately */
@@ -136,6 +138,7 @@ class RouterViewModel(app: Application) : AndroidViewModel(app) {
         val save = store.fastLogin
         conn = Conn.Connecting
         api = RouterApi(ip, user, pass)
+        routerHost = ip
         api.useSockets(net.socketFactory())
         viewModelScope.launch {
             val ok = withContext(Dispatchers.IO) { runCatching { api.login() }.getOrDefault(false) }
@@ -202,6 +205,7 @@ class RouterViewModel(app: Application) : AndroidViewModel(app) {
             runCatching { withSession { api.uptimeSeconds() } }.getOrNull()?.let { if (it >= 0) uptimeSec = it }
             runCatching { withSession { api.wanBytes() } }.getOrNull()?.let { downBytes = it.first; upBytes = it.second }
             runCatching { withSession { api.serialNumber() } }.getOrNull()?.let { if (!it.isNullOrBlank()) serial = it }
+            runCatching { api.productName() }.getOrNull()?.takeIf { it.isNotBlank() }?.let { routerModel = it }
         }
         loadConfigInfo()
     }

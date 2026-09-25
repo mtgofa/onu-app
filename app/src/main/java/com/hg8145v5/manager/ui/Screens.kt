@@ -48,12 +48,15 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.hg8145v5.manager.R
-import com.hg8145v5.manager.CrashLog
 import com.hg8145v5.manager.BuildConfig
 import com.hg8145v5.manager.net.Device
+import com.hg8145v5.manager.net.fetchRouterModel
+import com.hg8145v5.manager.net.gatewayIp
 import com.hg8145v5.manager.vm.Conn
 import com.hg8145v5.manager.vm.RouterViewModel
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.withContext
 
 /* sheet models */
 private sealed interface Sheet
@@ -159,14 +162,27 @@ private fun SplashScreen() {
 private fun LoginScreen(vm: RouterViewModel) {
     val tk = tk()
     val saved = remember { vm.savedCreds }
-    var ip by remember { mutableStateOf(saved?.ip ?: "192.168.100.1") }
+    var ip by remember { mutableStateOf(saved?.ip ?: "") }
     var user by remember { mutableStateOf(saved?.user ?: "admin") }
     var pass by remember { mutableStateOf(saved?.pass ?: "") }
     var show by remember { mutableStateOf(false) }
     var fast by remember { mutableStateOf(vm.fastLogin) }
+    var model by remember { mutableStateOf<String?>(null) }
     fun s(en: String, ar: String) = tr(vm.lang, en, ar)
+    val ctx = LocalContext.current.applicationContext
 
-    LaunchedEffect(Unit) { if (fast && saved != null) vm.login(saved.ip, saved.user, saved.pass) }
+    LaunchedEffect(Unit) {
+        if (fast && saved != null) { vm.login(saved.ip, saved.user, saved.pass); return@LaunchedEffect }
+        // auto-discover the router on the current network instead of hardcoding the gateway
+        withContext(Dispatchers.IO) {
+            val gw = gatewayIp(ctx)
+            withContext(Dispatchers.Main) { if (ip.isBlank()) ip = gw ?: "192.168.100.1" }
+            val probeTarget = if (saved != null) saved.ip else gw ?: "192.168.100.1"
+            fetchRouterModel(probeTarget)?.let { discovered ->
+                withContext(Dispatchers.Main) { model = discovered; vm.routerModel = discovered }
+            }
+        }
+    }
 
     Column(
         Modifier.fillMaxSize().statusBarsPadding().padding(horizontal = 22.dp).verticalScroll(rememberScrollState()),
@@ -182,7 +198,15 @@ private fun LoginScreen(vm: RouterViewModel) {
             fontFamily = tk.ui, fontSize = 13.sp, color = tk.ink2)
         Spacer(Modifier.height(26.dp))
 
-        Field(vm, s("Router address", "عنوان الراوتر"), ip, { ip = it }, mono = true)
+        Field(vm, s("Router address", "عنوان الراوتر"), ip, { ip = it }, mono = true,
+            trailing = {
+                model?.let {
+                    Surface(shape = RoundedCornerShape(8.dp), color = tk.accentSoft, modifier = Modifier.padding(end = 12.dp)) {
+                        Text(" $it ", Modifier.padding(horizontal = 6.dp, vertical = 3.dp),
+                            fontFamily = tk.mono, fontSize = 10.sp, color = tk.accent)
+                    }
+                }
+            })
         Field(vm, s("Username", "اسم المستخدم"), user, { user = it }, mono = true)
         Field(vm, s("Password", "كلمة المرور"), pass, { pass = it }, mono = true,
             password = !show,
@@ -215,28 +239,6 @@ private fun LoginScreen(vm: RouterViewModel) {
         Spacer(Modifier.height(20.dp))
         Text(s("Direct local HTTPS connection to your router", "اتصال محلي مباشر بالراوتر عبر HTTPS"),
             fontFamily = tk.ui, fontSize = 11.sp, color = tk.ink3, textAlign = TextAlign.Center)
-        val ctx = LocalContext.current
-        val lastCrash = remember { CrashLog.lastCrash(ctx.applicationContext) }
-        if (lastCrash != null) {
-            var show by remember { mutableStateOf(true) }
-            if (show) {
-                Spacer(Modifier.height(10.dp))
-                Surface(Modifier.fillMaxWidth(), shape = RoundedCornerShape(12.dp), color = tk.badSoft) {
-                    Row(Modifier.padding(10.dp), verticalAlignment = Alignment.Top) {
-                        Column(Modifier.weight(1f)) {
-                            Text(s("Last crash — please send this to the developer:", "آخر عطل — ابعته للمطور من فضلك:"),
-                                fontFamily = tk.ui, fontSize = 11.sp, fontWeight = FontWeight.W600, color = tk.bad)
-                            Spacer(Modifier.height(4.dp))
-                            Text(lastCrash, fontFamily = tk.mono, fontSize = 8.5.sp, lineHeight = 10.sp, color = tk.ink2)
-                        }
-                        TextButton(onClick = { CrashLog.clear(ctx.applicationContext); show = false }) {
-                            Text(s("OK", "تمام"), fontFamily = tk.ui, fontSize = 11.sp, color = tk.bad)
-                        }
-                    }
-                }
-            }
-            Spacer(Modifier.height(10.dp))
-        }
         VersionTag(tk)
         Spacer(Modifier.height(24.dp))
     }
@@ -263,7 +265,8 @@ private fun MainScaffold(vm: RouterViewModel, setSheet: (Sheet?) -> Unit) {
                         else -> s("Home", "الرئيسية")
                     }, fontFamily = tk.ui, fontWeight = FontWeight.W700, fontSize = 19.sp, color = tk.ink
                 )
-                Text("HG8145V5 · 192.168.100.1", fontFamily = tk.mono, fontSize = 11.sp, color = tk.ink2, maxLines = 1)
+                Text("${vm.routerModel.ifEmpty { "HG8145V5" }} · ${vm.routerHost.ifEmpty { "auto" }}",
+                    fontFamily = tk.mono, fontSize = 11.sp, color = tk.ink2, maxLines = 1)
             }
             ConnPill(vm)
         }

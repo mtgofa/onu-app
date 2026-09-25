@@ -16,7 +16,6 @@ import com.hg8145v5.manager.vm.RouterViewModel
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        CrashLog.install(applicationContext)
         enableEdgeToEdge()
         setContent {
             val vm: RouterViewModel = viewModel()
