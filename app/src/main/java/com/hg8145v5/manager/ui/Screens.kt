@@ -158,6 +158,8 @@ fun OnuApp(vm: RouterViewModel = viewModel()) {
         }
         // bottom sheet
         SheetHost(sheet, vm) { sheet = it }
+        // new version popup — pops up by itself, no need to walk into More
+        if (vm.updatePrompt) UpdatePrompt(vm) { vm.laterUpdate() }
         // restart overlay
         if (vm.restarting) RestartOverlay(vm)
         // splash
@@ -1699,6 +1701,75 @@ private fun ColumnScope.DeviceBody(vm: RouterViewModel, d: Device, setSheet: (Sh
 }
 
 /* ============ RESTART OVERLAY ============ */
+@Composable
+private fun UpdatePrompt(vm: RouterViewModel, onLater: () -> Unit) {
+    val tk = tk()
+    fun s(en: String, ar: String) = tr(vm.lang, en, ar)
+    val busy = vm.updateDownloading
+    Box(Modifier.fillMaxSize().background(tk.surface2.copy(alpha = .9f))
+        .clickable(enabled = busy) {}, Alignment.Center) {
+        Column(Modifier.padding(horizontal = 24.dp),
+            horizontalAlignment = Alignment.CenterHorizontally) {
+            PanelCard(Modifier.fillMaxWidth()) {
+                Column(Modifier.padding(20.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                    Box(Modifier.size(56.dp).clip(RoundedCornerShape(17.dp)).background(tk.accentSoft), Alignment.Center) {
+                        Icon(WIcon.download, null, tint = tk.accent, modifier = Modifier.size(28.dp))
+                    }
+                    Spacer(Modifier.height(14.dp))
+                    Text(s("Update available", "توجد نسخة جديدة"),
+                        fontFamily = tk.ui, fontWeight = FontWeight.W700, fontSize = 19.sp,
+                        color = tk.ink, textAlign = TextAlign.Center)
+                    Spacer(Modifier.height(6.dp))
+                    Text(
+                        if (busy) s("Downloading…", "جاري تنزيل التحديث…")
+                        else s("A new version was released. Update now?",
+                            "فيه نسخة جديدة. تحب تحدّث دلوقتي؟"),
+                        fontFamily = tk.ui, fontSize = 13.sp, color = tk.ink2,
+                        textAlign = TextAlign.Center, modifier = Modifier.fillMaxWidth())
+                    Spacer(Modifier.height(12.dp))
+                    val rel = vm.updateRelease
+                    if (rel != null) {
+                        Row(Modifier.clip(RoundedCornerShape(10.dp)).background(tk.surface3)
+                            .padding(horizontal = 12.dp, vertical = 7.dp),
+                            verticalAlignment = Alignment.CenterVertically) {
+                            Text(s("New version", "النسخة الجديدة"),
+                                fontFamily = tk.ui, fontSize = 12.sp, color = tk.ink2)
+                            Spacer(Modifier.width(8.dp))
+                            Text(rel.tagName, fontFamily = tk.mono, fontWeight = FontWeight.W700,
+                                fontSize = 12.5.sp, color = tk.accent)
+                        }
+                    }
+                    if (busy) {
+                        Spacer(Modifier.height(16.dp))
+                        CircularProgressIndicator(Modifier.size(26.dp), strokeWidth = 2.5.dp, color = tk.accent)
+                    }
+                    if (vm.updateAvailable && !busy && vm.updateMsg.isNotBlank() &&
+                        vm.updateMsg.startsWith(s("Update check failed", "فشل فحص التحديث"))) {
+                        Spacer(Modifier.height(10.dp))
+                        Text(vm.updateMsg, fontFamily = tk.ui, fontSize = 11.5.sp, color = tk.bad,
+                            textAlign = TextAlign.Center, modifier = Modifier.fillMaxWidth())
+                    }
+                    Spacer(Modifier.height(18.dp))
+                    if (busy) {
+                        FilledSheetButton(s("Please wait…", "لحظة…"), Modifier.fillMaxWidth(),
+                            tk.accent, Color.White) {}
+                    } else {
+                        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                            GhostButton(s("Later", "لاحقاً"), Modifier.weight(1f), onLater)
+                            FilledSheetButton(s("Update now", "تحديث الآن"), Modifier.weight(1f),
+                                tk.accent, Color.White) { vm.installUpdate() }
+                        }
+                    }
+                }
+            }
+            Spacer(Modifier.height(14.dp))
+            Text(s("You can also install it later from More → About & updates",
+                    "تقدر تحدّث بعدين من «المزيد» ← «حول والتحديثات»"),
+                fontFamily = tk.ui, fontSize = 11.sp, color = tk.ink3, textAlign = TextAlign.Center)
+        }
+    }
+}
+
 @Composable
 private fun RestartOverlay(vm: RouterViewModel) {
     val tk = tk()

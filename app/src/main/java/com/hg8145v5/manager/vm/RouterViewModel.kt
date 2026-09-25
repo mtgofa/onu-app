@@ -78,6 +78,8 @@ class RouterViewModel(app: Application) : AndroidViewModel(app) {
     var updateDownloading by mutableStateOf(false); private set
     var updateRelease by mutableStateOf<AppRelease?>(null); private set
     var updateMsg by mutableStateOf(""); private set
+    /** the "new version" popup - set as soon as a check finds one, so nobody misses an update */
+    var updatePrompt by mutableStateOf(false); private set
 
     // live status (read directly from the router, no computation)
     var rxDbm by mutableStateOf<String?>(null); private set
@@ -294,6 +296,8 @@ class RouterViewModel(app: Application) : AndroidViewModel(app) {
                 is UpdateCheck.Result.Available -> {
                     updateAvailable = true; updateRelease = r.rel
                     updateMsg = t("Update ", "يوجد تحديث ") + r.rel.tagName
+                    // a silent check is only silent about errors — a real update must always speak up
+                    updatePrompt = true
                 }
                 is UpdateCheck.Result.Failed -> if (!auto)
                     updateMsg = t("Update check failed: ", "فشل فحص التحديث: ") + r.reason
@@ -301,6 +305,9 @@ class RouterViewModel(app: Application) : AndroidViewModel(app) {
             updateChecking = false
         }
     }
+
+    /** "Later": hide the popup until the app is opened again (About still shows the update). */
+    fun laterUpdate() { updatePrompt = false }
 
     /** Download the new APK (SHA-256 verified), then hand it to the system installer. */
     fun installUpdate() {
@@ -315,11 +322,13 @@ class RouterViewModel(app: Application) : AndroidViewModel(app) {
             }
             if (file == null) {
                 updateDownloading = false
-                updateAvailable = false
+                // keep the update "available" and the popup open so the reason is readable and retryable
+                updateAvailable = true
                 updateMsg = t("Download or signature check failed", "فشل التنزيل أو فحص التوقيع")
             } else {
                 updateDownloading = false
                 updateMsg = t("Installing…", "جاري التثبيت…")
+                updatePrompt = false
                 val uri = FileProvider.getUriForFile(app, app.packageName + ".fileprovider", file)
                 val launch = Intent(Intent.ACTION_VIEW)
                     .setDataAndType(uri, "application/vnd.android.package-archive")

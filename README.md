@@ -150,5 +150,6 @@ is modified and no setting is changed outside what you do in the app.
 
 ## License
 
-Source available for personal use. No warranty — you are responsible for the changes you apply to
-your network.
+[MIT](LICENSE) © 2026 mtgofa — use it, change it, ship it; just keep the credit.
+The app talks to your own router, so you are responsible for the changes you apply to your
+network.
