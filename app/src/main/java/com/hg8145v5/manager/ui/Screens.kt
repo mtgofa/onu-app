@@ -381,7 +381,8 @@ private fun HomeScreen(vm: RouterViewModel, setSheet: (Sheet?) -> Unit) {
         UsageBox(vm)
         Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
             StatTile(Modifier.weight(1f).clickable { vm.screen = "devices"; vm.refresh() }, WIcon.devices, s("Devices", "الأجهزة"), "${vm.deviceCount}", false, tk.good, tk.goodSoft)
-            StatTile(Modifier.weight(1f), WIcon.router, s("Model", "الموديل"), "HG8145V5", false, tk.warn, tk.warnSoft)
+            StatTile(Modifier.weight(1f), WIcon.router, s("Model", "الموديل"),
+                vm.routerModel.ifEmpty { "HG8145V5" }, false, tk.warn, tk.warnSoft)
         }
         SectionHeader(s("Quick actions", "إجراءات سريعة"), null)
         PanelCard {
@@ -1318,7 +1319,7 @@ private fun MoreScreen(vm: RouterViewModel, setSheet: (Sheet?) -> Unit) {
 
         SectionHeader(s("Device info", "معلومات الجهاز")) { Badge(s("Live", "مباشر"), tk.accent, tk.accentSoft) }
         PanelCard {
-            KV(s("Model", "الموديل"), "HG8145V5"); Divider2()
+            KV(s("Model", "الموديل"), vm.routerModel.ifEmpty { "HG8145V5" }); Divider2()
             KV(s("Firmware", "الفيرموير"), "V5R022C10S203"); Divider2()
             KV(s("Serial number", "الرقم التسلسلي"), vm.serial ?: "—")
         }
